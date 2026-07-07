@@ -2,12 +2,18 @@ import queue
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from typing import Any
 
 import torch
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+from vllm.v1.core.session_aware_pooling_manager import (
+    SessionKeyTracker,
+    SessionAwarePoolingManager,
+    KVCacheKeepAliveThread,
+)
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 
@@ -226,6 +232,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests = defaultdict[str, int](int)
         self.enable_kv_event = enable_kv_event
+        self._on_put_complete: callable | None = None
+
+    def set_on_put_complete(self, callback: Callable[[str, list[str], list[str]], None]) -> None:
+        self._on_put_complete = callback
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -358,6 +368,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if current_event is not None:
                 current_event.synchronize()
             self.m_store.put(keys, addrs, sizes)
+            # put 完成后，如果有 session_id，通知 SPM 记录 PoolKey
+            if req_meta.session_id is not None and self._on_put_complete is not None:
+                self._on_put_complete(
+                    req_meta.session_id,
+                    keys,            # 本次 put 的所有 PoolKey
+                    block_hashes,    # 对应的 block hash
+                )
 
             # TODO Query specific replica info to update the event
             if self.enable_kv_event and stored_events is not None:
