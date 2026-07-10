@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.core.session_aware_pooling_manager import get_session_key_tracker
+from vllm.v1.core.session_aware_pooling_manager import SessionKeyTracker
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
@@ -201,7 +201,7 @@ class KVPoolWorker:
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
 
-        self.session_key_tracker = get_session_key_tracker()
+        self.session_key_tracker = SessionKeyTracker()
 
         self.finished_store_req: set[str] = set()
 
