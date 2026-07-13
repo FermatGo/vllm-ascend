@@ -106,6 +106,7 @@ class KVPoolScheduler:
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self._prefetch_req_metas: list[ReqMeta] = []
+        self._offload_req_metas: list[ReqMeta] = []
 
     def _infer_group_families(self) -> list[str]:
         kv_cache_groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
