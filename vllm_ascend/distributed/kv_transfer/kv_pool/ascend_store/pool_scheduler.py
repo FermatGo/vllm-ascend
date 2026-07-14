@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
-
+from vllm.v1.core.session_aware_pooling_manager import PrefetchRequest
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     LoadSpec,
@@ -326,10 +326,9 @@ class KVPoolScheduler:
         )
 
     def add_prefetch_request(self, prefetch_req: PrefetchRequest, 
-                              matched_tokens: int,
-                              request_tuple: tuple[Request, list[list[int]]]) -> None:
+                              matched_tokens: int) -> None:
         """由 SPM 调用，添加 prefetch 请求的元数据"""
-        request, block_ids = request_tuple
+        block_ids = prefetch_req.dest_block_ids
         load_spec = LoadSpec(
             vllm_cached_tokens=0,
             kvpool_cached_tokens=matched_tokens,
@@ -340,7 +339,7 @@ class KVPoolScheduler:
         request_tracker = RequestTracker(
             req_id=prefetch_req.request_id,
             token_len=num_tokens_to_compute,
-            allocated_block_ids_by_group=block_ids,
+            allocated_block_ids_by_group=normalize_block_ids_by_group(block_ids),
             num_saved_tokens=0,
         )
         req_meta = ReqMeta.from_request_tracker(
