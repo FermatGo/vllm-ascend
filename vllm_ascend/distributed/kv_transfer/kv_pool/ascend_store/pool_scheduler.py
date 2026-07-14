@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
-from vllm.v1.serial_utils import MsgpackEncoder
+from vllm.v1.serial_utils import MsgpackEncoder, MsgpackDecoder
 from vllm.v1.core.session_aware_pooling_manager import PrefetchRequest
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
@@ -326,7 +326,7 @@ class KVPoolScheduler:
             [len(blocks) for blocks in local_block_ids],
         )
 
-    def add_prefetch_request(self, prefetch_req: PrefetchRequest, 
+    def add_prefetch_request(self, prefetch_req: PrefetchRequest,
                               matched_tokens: int) -> None:
         """由 SPM 调用，添加 prefetch 请求的元数据"""
         block_ids = prefetch_req.dest_block_ids
@@ -586,6 +586,7 @@ class KVPoolScheduler:
 class LookupKeyClient:
     def __init__(self, vllm_config: "VllmConfig", rpc_port_bias: int = 0):
         self.encoder = MsgpackEncoder()
+        self.decoder = MsgpackDecoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config, rpc_port_bias)
         self.socket = make_zmq_socket(
@@ -614,13 +615,15 @@ class LookupKeyClient:
 
     def lookup_key(self, pool_keys_list: list[str]) -> list[int]:
         logger.info(f"LookupKeyClient send pool_keys_list {pool_keys_list}")
-        payload_bytes = self.encoder.encode(pool_keys_list)
+        frame_seq = self.encoder.encode(pool_keys_list)
+        payload_bytes = frame_seq[0]
         self.socket.send_multipart([payload_bytes], copy=False)
+
         resp_bytes = self.socket.recv()
-        # 服务端把 list[int] 通过msgpack返回，客户端解包
-        result_list: list[int] = self.encoder.decode(resp_bytes)
+        result_list: list[int] = self.decoder.decode(resp_bytes)
         logger.info(f"LookupKeyClient receive result_list {result_list}")
         return result_list
+
 
     def close(self):
         self.socket.close(linger=0)
@@ -640,6 +643,6 @@ def get_zmq_rpc_path_lookup(vllm_config: "VllmConfig", rpc_port_bias: int = 0) -
             logger.warning(
                 "It is recommended to use the lookup_rpc_port, as the mooncake_rpc_port will be removed in the future."
             )
-    rpc_port += rpc_port_bias
+    rpc_port = int(rpc_port) + rpc_port_bias
     logger.info("Base URL: %s, RPC Port: %s", base_url, rpc_port)
     return f"ipc://{base_url}/lookup_rpc_port_{rpc_port}_dp_rank{dp_rank}"
