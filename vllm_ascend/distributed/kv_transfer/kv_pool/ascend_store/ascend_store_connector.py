@@ -110,6 +110,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             assert self.connector_worker is not None
             if vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config, self.use_layerwise)
+                self.spm_lookup_server = LookupKeyServer(self.connector_worker, vllm_config, self.use_layerwise,
+                                                         rpc_port_bias=1, lookup_spm_keys=True)
 
     ############################################################
     # Scheduler Side Methods
@@ -250,6 +252,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         ascend_store_kv_events.add_events(events)
         return ascend_store_kv_events
 
+    def look_up_keys(self, pool_keys_list: list[str]) -> list[bool]:
+        result = [match_token > 0 for match_token in self.connector_scheduler.client_spm.lookup_key(pool_keys_list)]
+        return result
 
 class LookupKeyServer:
     def __init__(
@@ -257,11 +262,13 @@ class LookupKeyServer:
         pool_worker: KVPoolWorker,
         vllm_config: "VllmConfig",
         use_layerwise: bool,
+        rpc_port_bias: int = 0,
+        lookup_spm_keys: bool = False
     ):
         self.decoder = MsgpackDecoder()
         self.decoder_tensor = MsgpackDecoder(torch.Tensor)
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        socket_path = get_zmq_rpc_path_lookup(vllm_config, rpc_port_bias)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
@@ -295,7 +302,32 @@ class LookupKeyServer:
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 
-        self.thread = threading.Thread(target=process_request, daemon=True)
+        def process_spm_request():
+            while self.running:
+                try:
+                    frame = self.socket.recv(copy=False)
+                    key_list: list[str] = self.decoder.decode(bytes(frame))
+                    logger.info(f"LookupKeyServer receive key_list {key_list}")
+                    # 业务查询：返回 list[int]
+                    hit_list = self.pool_worker.m_store.exists(key_list)
+                    logger.info(f"LookupKeyServer send hit_list {hit_list}")
+                    # msgpack 打包返回
+                    resp_bytes = self.decoder.encode(hit_list)
+
+                    self.socket.send(resp_bytes)
+
+                    logger.info(
+                        "SPM key lookup done, key_length=%d hit_length=%d",
+                        len(key_list), len(hit_list)
+                    )
+                except zmq.ZMQError:
+                    if not self.running:
+                        break
+
+        if lookup_spm_keys:
+            self.thread = threading.Thread(target=process_spm_request, daemon=True)
+        else:
+            self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
 
     def close(self):
