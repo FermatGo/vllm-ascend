@@ -106,7 +106,6 @@ class KVPoolScheduler:
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self._prefetch_req_metas: list[ReqMeta] = []
-        self._offload_req_metas: list[ReqMeta] = []
 
     def _infer_group_families(self) -> list[str]:
         kv_cache_groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
@@ -326,29 +325,6 @@ class KVPoolScheduler:
             [len(blocks) for blocks in local_block_ids],
         )
 
-    def add_offload_request(self, offload_req) -> None:
-        """由 SPM 调用，添加 offload 请求的元数据"""
-        block_ids_by_group = normalize_block_ids_by_group(offload_req.block_ids)
-        request_tracker = RequestTracker(
-            req_id=offload_req.request_id,
-            token_len=offload_req.token_len,
-            allocated_block_ids_by_group=block_ids_by_group,
-            num_saved_tokens=0,
-        )
-        req_meta = ReqMeta.from_request_tracker(
-            request_tracker,
-            self.cache_transfer_granularity,
-            load_spec=None,           # offload 不需要 load
-            skip_save=False,          # can_save=True
-            block_hashes=offload_req.block_hashes,
-            is_last_chunk=True,
-            discard_partial_chunks=False,
-            kv_cache_group_families=self.kv_cache_group_families,
-            session_id=offload_req.session_id,
-        )
-        if req_meta is not None:
-            self._offload_req_metas.append(req_meta)
-
     def add_prefetch_request(self, prefetch_req: PrefetchRequest, 
                               matched_tokens: int,
                               request_tuple: tuple[Request, list[list[int]]]) -> None:
@@ -557,10 +533,6 @@ class KVPoolScheduler:
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
-        # 追加 offload 请求
-        for offload_meta in self._offload_req_metas:
-            meta.add_request(offload_meta)
-        self._offload_req_metas.clear()
 
         # 追加 prefetch 请求
         for prefetch_meta in self._prefetch_req_metas:
