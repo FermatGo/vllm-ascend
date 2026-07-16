@@ -373,7 +373,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._on_put_complete(
                     req_meta.session_id,
                     keys,            # 本次 put 的所有 PoolKey
-                    new_block_hashes,    # 对应的 block hash
+                    block_hashes,    # 对应的 block hash
                 )
 
             # TODO Query specific replica info to update the event
