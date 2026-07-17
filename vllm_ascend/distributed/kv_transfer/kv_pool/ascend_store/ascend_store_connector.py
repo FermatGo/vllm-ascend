@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
@@ -252,10 +253,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         ascend_store_kv_events.add_events(events)
         return ascend_store_kv_events
 
-    def look_up_keys(self, pool_keys_list: list[str]) -> list[bool]:
-        look_up_result = self.connector_scheduler.client_spm.lookup_key(pool_keys_list)
-        result = [match_token > 0 for match_token in look_up_result]
-        return result
+    def look_up_keys(self, token_len: int, block_hashes_list: list[BlockHash]) -> None:
+        look_up_result = self.connector_scheduler.client_spm.lookup(token_len, block_hashes_list, self.connector_scheduler.kv_cache_group_ids)
+        return look_up_result
+
 
 class LookupKeyServer:
     def __init__(
@@ -303,40 +304,7 @@ class LookupKeyServer:
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 
-        def process_spm_request():
-            while self.running:
-                frame = None
-                try:
-                    frame = self.socket.recv(copy=False)
-                    # ==========重点9：zmq.Frame -> bytes之后交给decoder解析list[str]==========
-                    raw_data = bytes(frame)
-                    key_list: list[str] = self.decoder.decode(raw_data)
-                    logger.debug(f"LookupKeyServer receive key_list {key_list}")
-                    hit_list = self.pool_worker.m_store.exists(key_list)
-                    logger.debug(f"LookupKeyServer send hit_list {hit_list}")
-
-                    # ==========重点10：使用encoder序列化返回值，encode返回列表，取[0]得到bytes发送给客户端==========
-                    buf_seq = self.encoder.encode(hit_list)
-                    resp_bytes = buf_seq[0]
-                    self.socket.send(resp_bytes, copy=False)
-
-                    logger.info(
-                        "SPM key lookup done, key_length=%d hit_length=%d",
-                        len(key_list), len(hit_list)
-                    )
-                except zmq.ZMQError:
-                    if not self.running:
-                        break
-                except Exception:
-                    logger.exception("process_spm_request error")
-                    # REP模式出错也要返回空数据包
-                    self.socket.send(b"", copy=False)
-
-        if lookup_spm_keys:
-            self.encoder = MsgpackEncoder()
-            self.thread = threading.Thread(target=process_spm_request, daemon=True)
-        else:
-            self.thread = threading.Thread(target=process_request, daemon=True)
+        self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
 
     def close(self):

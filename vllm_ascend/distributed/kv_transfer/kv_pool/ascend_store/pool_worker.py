@@ -23,7 +23,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.core.session_aware_pooling_manager import SessionKeyTracker
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
@@ -200,8 +199,6 @@ class KVPoolWorker:
 
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
-
-        self.session_key_tracker = SessionKeyTracker()
 
         self.finished_store_req: set[str] = set()
 
@@ -429,10 +426,6 @@ class KVPoolWorker:
                     self.kv_role,
                     ready_event_sending,
                     self.enable_kv_events,
-                )
-                # 注册 on_put_complete 回调，将 put 完成的 PoolKey 记录到 session_key_tracker
-                self.kv_send_thread.set_on_put_complete(
-                    self.session_key_tracker.add_keys
                 )
                 self.kv_send_thread.start()
             if self.load_async:

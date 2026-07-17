@@ -613,18 +613,6 @@ class LookupKeyClient:
         result = int.from_bytes(resp, "big")
         return result
 
-    def lookup_key(self, pool_keys_list: list[str]) -> list[int]:
-        logger.debug(f"LookupKeyClient send pool_keys_list {pool_keys_list}")
-        frame_seq = self.encoder.encode(pool_keys_list)
-        payload_bytes = frame_seq[0]
-        self.socket.send_multipart([payload_bytes], copy=False)
-
-        resp_bytes = self.socket.recv()
-        result_list: list[int] = self.decoder.decode(resp_bytes)
-        logger.debug(f"LookupKeyClient receive result_list {result_list}")
-        return result_list
-
-
     def close(self):
         self.socket.close(linger=0)
 
