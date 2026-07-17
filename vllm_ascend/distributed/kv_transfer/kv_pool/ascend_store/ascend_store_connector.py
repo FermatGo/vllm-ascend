@@ -311,9 +311,9 @@ class LookupKeyServer:
                     # ==========重点9：zmq.Frame -> bytes之后交给decoder解析list[str]==========
                     raw_data = bytes(frame)
                     key_list: list[str] = self.decoder.decode(raw_data)
-                    logger.info(f"LookupKeyServer receive key_list {key_list}")
+                    logger.debug(f"LookupKeyServer receive key_list {key_list}")
                     hit_list = self.pool_worker.m_store.exists(key_list)
-                    logger.info(f"LookupKeyServer send hit_list {hit_list}")
+                    logger.debug(f"LookupKeyServer send hit_list {hit_list}")
 
                     # ==========重点10：使用encoder序列化返回值，encode返回列表，取[0]得到bytes发送给客户端==========
                     buf_seq = self.encoder.encode(hit_list)
