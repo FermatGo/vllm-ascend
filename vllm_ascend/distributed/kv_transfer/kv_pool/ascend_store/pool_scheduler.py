@@ -331,12 +331,12 @@ class KVPoolScheduler:
         """由 SPM 调用，添加 prefetch 请求的元数据"""
         block_ids = prefetch_req.dest_block_ids
         load_spec = LoadSpec(
-            vllm_cached_tokens=0,
+            vllm_cached_tokens=prefetch_req.vllm_cache_tokens,
             kvpool_cached_tokens=matched_tokens,
             can_load=True,
-            token_len=matched_tokens,
+            token_len=prefetch_req.token_len,
         )
-        num_tokens_to_compute = matched_tokens
+        num_tokens_to_compute = prefetch_req.token_len
         request_tracker = RequestTracker(
             req_id=prefetch_req.request_id,
             token_len=num_tokens_to_compute,
@@ -595,6 +595,7 @@ class LookupKeyClient:
             zmq.REQ,  # type: ignore[attr-defined]
             bind=False,
         )
+        self.rpc_port_bias = rpc_port_bias
 
     def lookup(
         self,

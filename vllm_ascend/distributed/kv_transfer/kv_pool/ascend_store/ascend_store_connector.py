@@ -254,6 +254,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return ascend_store_kv_events
 
     def look_up_keys(self, token_len: int, block_hashes_list: list[BlockHash]) -> None:
+        logger.debug(f"AscendStoreConnector.look_up_keys: lookup token_len: {token_len}")
+        logger.debug(f"AscendStoreConnector.look_up_keys: lookup block_hashes: {block_hashes_list}")
+        logger.debug(f"AscendStoreConnector.look_up_keys: lookup block_hashes_len: {len(block_hashes_list)}")
         look_up_result = self.connector_scheduler.client_spm.lookup(token_len, block_hashes_list, self.connector_scheduler.kv_cache_group_ids)
         return look_up_result
 
