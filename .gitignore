@@ -218,5 +218,3 @@ csrc/third_party/
 
 # claude code skills
 .claude/skills/*
-
-.codemate
