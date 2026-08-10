@@ -420,7 +420,6 @@ class KVPoolScheduler:
                 discard_partial_chunks=self._discard_partial_chunks,
                 original_block_size=self.original_block_size,
                 kv_cache_group_families=self.kv_cache_group_families,
-                session_id=request.session_id,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)

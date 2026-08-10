@@ -581,9 +581,6 @@ class ReqMeta:
     token_ids: list[int] | None = None
     original_block_size: list[int] | int | None = None
 
-    # Session id
-    session_id: str | None = None  # 新增：传递 session 信息到 Worker 侧
-
     def __init__(
         self,
         req_id: str,
@@ -601,7 +598,6 @@ class ReqMeta:
         token_ids: list[int] | None = None,
         original_block_size: list[int] | int | None = None,
         block_ids: list[int] | list[list[int]] | None = None,
-        session_id: str | None = None,
     ) -> None:
         self.req_id = req_id
         self.token_len_chunk = token_len_chunk
@@ -619,7 +615,6 @@ class ReqMeta:
         self.disable_tp_key_sharding = disable_tp_key_sharding
         self.token_ids = token_ids
         self.original_block_size = original_block_size
-        self.session_id = session_id
 
     @property
     def block_ids(self) -> list[int]:
@@ -640,7 +635,6 @@ class ReqMeta:
         discard_partial_chunks: bool = True,
         original_block_size: list[int] | int | None = None,
         kv_cache_group_families: list[str] | None = None,
-        session_id: str | None = None,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         if block_hashes is None:
@@ -685,7 +679,6 @@ class ReqMeta:
             original_block_size=original_block_size,
             kv_cache_group_ids=list(range(len(tracker.allocated_block_ids_by_group))),
             kv_cache_families_by_group=kv_cache_group_families,
-            session_id=session_id,
         )
 
 
