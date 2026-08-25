@@ -51,11 +51,11 @@ class AscendAgentHintManager(AgentHintManager):
             on_block_cache_hit=(self._session_manager.on_block_cache_hit_for_request),
         )
 
-    def is_management_request(self, request: Request) -> bool:
+    def is_kvc_management_request(self, request: Request) -> bool:
         hint = request.agent_hint
         return bool(hint and hint.context_management and hint.context_management.manage_request)
 
-    def handle_management_request(self, request: Request) -> AgentHintResponse | None:
+    def register_kvc_management_request(self, request: Request) -> AgentHintResponse | None:
         hint = request.agent_hint
         if hint is None or hint.context_management is None:
             return None
