@@ -16,7 +16,12 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     get_block_hash,
 )
-from vllm.v1.engine import CacheControlParams, ContextManagementEditsParams, ContextManagementParams
+from vllm_ascend.core.agent_hint.params import (
+    CacheControlParams,
+    ContextManagementEditsParams,
+    ContextManagementParams,
+    convert_agent_hint_dict,
+)
 from vllm.v1.request import Request
 
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
@@ -136,9 +141,11 @@ class SessionAwareManager:
     def on_blocks_allocated_for_request(
         self, request: Request, blocks: KVCacheBlocks, cached_blocks_len_before: tuple[int, ...] | None = None
     ) -> None:
+        # 解析引擎层透传的 opaque dict 为 ascend 强类型视图
+        hint = convert_agent_hint_dict(request.agent_hint)
         # 如果 request 没有 session_id，则不进行 session 相关的处理
         # 但是清理所有 block 的 session 引用和 TTL，避免残留
-        if not request.agent_hint or request.agent_hint.session_id is None:
+        if not hint or hint.session_id is None:
             for group_id, block_ids in enumerate(blocks.get_block_ids()):
                 for block_id in block_ids:
                     block = self._get_block(block_id)
@@ -156,34 +163,35 @@ class SessionAwareManager:
         is_prefill = request.num_output_tokens == 0
         logger.info(
             f"on_blocks_allocated_for_request, request_id = {request.request_id}, "
-            f"session_id = {request.agent_hint.session_id if request.agent_hint else None}, "
+            f"session_id = {hint.session_id if hint else None}, "
             f"block_ids = {blocks.get_block_ids()}, request.num_output_tokens: {request.num_output_tokens}"
         )
 
         self._on_blocks_allocated(
-            session_id=request.agent_hint.session_id,
-            parent_session_id=request.agent_hint.parent_session_id,
+            session_id=hint.session_id,
+            parent_session_id=hint.parent_session_id,
             blocks=blocks,
-            ephemeral_range=compute_ephemeral_range(request.agent_hint.cache_control),
+            ephemeral_range=compute_ephemeral_range(hint.cache_control),
             cached_blocks_len_before=cached_blocks_len_before,
             is_prefill=is_prefill,
         )
 
     def on_block_cache_hit_for_request(self, request: Request, blocks: KVCacheBlocks) -> None:
-        if request.agent_hint is None or request.agent_hint.session_id is None:
+        hint = convert_agent_hint_dict(request.agent_hint)
+        if hint is None or hint.session_id is None:
             return
 
         logger.info(
             f"on_block_cache_hit_for_request, request_id = {request.request_id}, "
-            f"session_id = {request.agent_hint.session_id if request.agent_hint else None}, "
+            f"session_id = {hint.session_id if hint else None}, "
             f"block_ids = {blocks.get_block_ids()}"
         )
 
         self._on_blocks_cache_hit(
-            session_id=request.agent_hint.session_id,
-            parent_session_id=request.agent_hint.parent_session_id,
+            session_id=hint.session_id,
+            parent_session_id=hint.parent_session_id,
             blocks=blocks,
-            ephemeral_range=compute_ephemeral_range(request.agent_hint.cache_control),
+            ephemeral_range=compute_ephemeral_range(hint.cache_control),
         )
 
     def _on_blocks_allocated(

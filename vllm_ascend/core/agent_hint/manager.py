@@ -19,6 +19,7 @@ from vllm.v1.core.agent_hint_manager import (
 )
 from vllm.v1.engine import AgentHintResponse
 
+from vllm_ascend.core.agent_hint.params import convert_agent_hint_dict
 from vllm_ascend.core.agent_hint.session_aware_manager import (
     SessionAwareManager,
 )
@@ -52,11 +53,11 @@ class AscendAgentHintManager(AgentHintManager):
         )
 
     def is_kvc_management_request(self, request: Request) -> bool:
-        hint = request.agent_hint
+        hint = convert_agent_hint_dict(request.agent_hint)
         return bool(hint and hint.context_management and hint.context_management.manage_request)
 
     def register_kvc_management_request(self, request: Request) -> AgentHintResponse | None:
-        hint = request.agent_hint
+        hint = convert_agent_hint_dict(request.agent_hint)
         if hint is None or hint.context_management is None:
             return None
         edit_results = self._session_manager.register_agent_hint(
@@ -70,7 +71,7 @@ class AscendAgentHintManager(AgentHintManager):
         )
 
     def on_request_added(self, request: Request) -> None:
-        hint = request.agent_hint
+        hint = convert_agent_hint_dict(request.agent_hint)
         self._session_manager.register_agent_hint(
             request.request_id,
             hint.session_id if hint else None,
@@ -78,7 +79,7 @@ class AscendAgentHintManager(AgentHintManager):
         )
 
     def on_request_scheduled(self, request: Request) -> None:
-        hint = request.agent_hint
+        hint = convert_agent_hint_dict(request.agent_hint)
         if hint is not None and hint.session_id:
             self._session_manager.register_session_block_hash(hint.session_id, request.block_hashes)
 

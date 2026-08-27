@@ -9,7 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.engine import AgentHintParams
+from vllm_ascend.core.agent_hint.params import convert_agent_hint_dict
 from vllm.v1.request import Request
 
 from vllm_ascend.core.agent_hint.session_aware_manager import SessionAwareManager
@@ -236,7 +236,7 @@ class SessionAwarePoolingManager(SessionEventListener):
         if not block_ids:
             logger.warning(
                 "Session %s has no allocated blocks, skipping prefetch",
-                prefetch_req.agent_hint.session_id if prefetch_req.agent_hint else None,
+                convert_agent_hint_dict(prefetch_req.agent_hint).session_id if prefetch_req.agent_hint else None,
             )
             return
 
@@ -332,7 +332,7 @@ class SessionAwarePoolingManager(SessionEventListener):
         for i in range(0, len(self.prefetch_running_queue)):
             free_prefetch_running_req = self.prefetch_running_queue[i]
             logger.info(
-                f"free prefetch request {free_prefetch_running_req.request_id} and session id {free_prefetch_running_req.agent_hint.session_id}"
+                f"free prefetch request {free_prefetch_running_req.request_id} and session id {convert_agent_hint_dict(free_prefetch_running_req.agent_hint).session_id if free_prefetch_running_req.agent_hint else None}"
             )
             self.sam.kv_cache_manager.free(free_prefetch_running_req)
         self.prefetch_running_queue = []
@@ -351,7 +351,7 @@ class SessionAwarePoolingManager(SessionEventListener):
 
                 local_hit_req = Request(
                     request_id=tmp_prefetch_req.request_id,
-                    agent_hint=AgentHintParams(session_id=tmp_prefetch_req.session_id),
+                    agent_hint={"session_id": tmp_prefetch_req.session_id},
                     prompt_token_ids=[0] * (tmp_prefetch_req.token_len + 1),
                     sampling_params=SamplingParams.from_optional(),
                     pooling_params=None,
@@ -395,7 +395,7 @@ class SessionAwarePoolingManager(SessionEventListener):
                     # HBM/远端有命中，尝试分配KV
                     tmp_req = Request(
                         request_id=tmp_prefetch_req.request_id,
-                        agent_hint=AgentHintParams(session_id=tmp_prefetch_req.session_id),
+                        agent_hint={"session_id": tmp_prefetch_req.session_id},
                         prompt_token_ids=[0] * (total_external_matched_tokens + local_computed_tokens),
                         sampling_params=SamplingParams.from_optional(),
                         pooling_params=None,
