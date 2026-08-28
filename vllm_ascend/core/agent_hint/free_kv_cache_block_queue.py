@@ -5,10 +5,9 @@
 
 import time
 
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
-logger = init_logger(__name__)
 
 
 class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):

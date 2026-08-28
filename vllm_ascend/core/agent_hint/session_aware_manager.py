@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -26,7 +26,6 @@ from vllm.v1.request import Request
 
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
 
-logger = init_logger(__name__)
 
 
 def split_base_block_hashes(

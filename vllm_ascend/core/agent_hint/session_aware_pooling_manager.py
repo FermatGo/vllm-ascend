@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm_ascend.core.agent_hint.params import convert_agent_hint_dict
@@ -14,8 +14,6 @@ from vllm.v1.request import Request
 
 from vllm_ascend.core.agent_hint.session_aware_manager import SessionAwareManager
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
-
-logger = init_logger(__name__)
 
 
 @dataclass
