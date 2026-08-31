@@ -24,6 +24,10 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_ascend.core.agent_hint.session_aware_pooling_manager import (
+    PrefetchRequest,
+)
+
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -142,6 +146,7 @@ class KVPoolScheduler:
             )
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._unfinished_request_ids: set[str] = set()
+        self._prefetch_req_metas: list[ReqMeta] = []
         self._loading_req_ids: set[str] = set()
         self._delayed_free_req_ids: set[str] = set()
 
@@ -223,6 +228,7 @@ class KVPoolScheduler:
         self.keys_per_block_hash = keys_per_block_hash
 
         self.client: LookupKeyClient | None = None
+        self.client_spm | None = None
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
         tracker = self._request_trackers.get(req_id)
@@ -567,6 +573,8 @@ class KVPoolScheduler:
                     return 0, False
                 if self.client is None:
                     self.client = LookupKeyClient(self.vllm_config)
+                if self.client_spm is None:
+                    self.client_spm = LookupKeyClient(vllm_config, rpc_port_bias=1)
                 num_external_hit_tokens = self.client.lookup(
                     token_len,
                     request.block_hashes,
@@ -956,6 +964,34 @@ class KVPoolScheduler:
             hash_block_size=self.hash_block_size,
         )
 
+    def add_prefetch_request(self, prefetch_req: PrefetchRequest, matched_tokens: int) -> None:
+        """由 SPM 调用，添加 prefetch 请求的元数据"""
+        block_ids = prefetch_req.dest_block_ids
+        load_spec = LoadSpec(
+            vllm_cached_tokens=prefetch_req.vllm_cache_tokens,
+            kvpool_cached_tokens=matched_tokens,
+            can_load=True,
+            token_len=prefetch_req.token_len,
+        )
+        num_tokens_to_compute = prefetch_req.token_len
+        request_tracker = RequestTracker(
+            req_id=prefetch_req.request_id,
+            token_len=num_tokens_to_compute,
+            allocated_block_ids_by_group=normalize_block_ids_by_group(block_ids),
+            num_saved_tokens=0,
+        )
+        req_meta = ReqMeta.from_request_tracker(
+            request_tracker,
+            self.cache_transfer_granularity,
+            load_spec=load_spec,
+            skip_save=True,  # prefetch 不保存
+            block_hashes=prefetch_req.block_hashes,
+            discard_partial_chunks=self._discard_partial_chunks,
+            kv_cache_group_families=self.kv_cache_group_families,
+        )
+        if req_meta is not None:
+            self._prefetch_req_metas.append(req_meta)
+
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         """Attach the connector metadata to the request object.
 
@@ -1029,6 +1065,11 @@ class KVPoolScheduler:
                 if req_meta is not None:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
+
+        # 追加 prefetch 请求
+        for prefetch_meta in self._prefetch_req_metas:
+            meta.add_request(prefetch_meta)
+        self._prefetch_req_metas.clear()
 
         return meta
 
@@ -1154,16 +1195,17 @@ class KVPoolScheduler:
 
 
 class LookupKeyClient:
-    def __init__(self, vllm_config: "VllmConfig"):
+    def __init__(self, vllm_config: "VllmConfig", rpc_port_bias: int = 0):
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        socket_path = get_zmq_rpc_path_lookup(vllm_config, rpc_port_bias)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
             zmq.REQ,  # type: ignore[attr-defined]
             bind=False,
         )
+        self.rpc_port_bias = rpc_port_bias
 
     def lookup(
         self,
@@ -1191,7 +1233,7 @@ class LookupKeyClient:
         self.socket.close(linger=0)
 
 
-def get_zmq_rpc_path_lookup(vllm_config: "VllmConfig") -> str:
+def get_zmq_rpc_path_lookup(vllm_config: "VllmConfig", rpc_port_bias: int = 0) -> str:
     dp_rank = vllm_config.parallel_config.data_parallel_rank
     base_url = envs.VLLM_RPC_BASE_PATH
     # Default to 0 if not configured
@@ -1205,5 +1247,6 @@ def get_zmq_rpc_path_lookup(vllm_config: "VllmConfig") -> str:
             logger.warning(
                 "It is recommended to use the lookup_rpc_port, as the mooncake_rpc_port will be removed in the future."
             )
+    rpc_port = int(rpc_port) + rpc_port_bias
     logger.debug("Base URL: %s, RPC Port: %s", base_url, rpc_port)
     return f"ipc://{base_url}/lookup_rpc_port_{rpc_port}_dp_rank{dp_rank}"

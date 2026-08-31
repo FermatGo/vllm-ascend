@@ -51,6 +51,16 @@ def register_connector():
     register_engine()
 
 
+def register_agent_hint():
+    _ensure_global_patch()
+ 
+    from vllm.v1.core.agent_hint_manager import register_agent_hint_backend
+ 
+    from vllm_ascend.core.agent_hint import ASCEND_AGENT_HINT_BACKEND
+ 
+    register_agent_hint_backend("ascend", ASCEND_AGENT_HINT_BACKEND)
+
+
 def register_model_loader():
     _ensure_global_patch()
 

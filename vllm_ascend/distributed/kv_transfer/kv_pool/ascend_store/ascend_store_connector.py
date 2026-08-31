@@ -130,6 +130,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             assert self.connector_worker is not None
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
+                self.spm_lookup_server = LookupKeyServer(self.connector_worker, vllm_config, rpc_port_bias=1)
 
     ############################################################
     # Scheduler Side Methods
@@ -303,6 +304,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
         assert self.connector_worker is not None
         return self.connector_worker.build_connector_worker_meta()
+    
+    def look_up_keys(self, token_len: int, block_hashes_list: list[BlockHash]) -> None:
+        look_up_result = self.connector_scheduler.client_spm.lookup(token_len, block_hashes_list, self.connector_scheduler.kv_cache_group_ids)
+        return look_up_result
 
 
 class LookupKeyServer:
@@ -310,10 +315,11 @@ class LookupKeyServer:
         self,
         pool_worker: KVPoolWorker,
         vllm_config: "VllmConfig",
+        rpc_port_bias: int = 0,
     ):
         self.decoder = MsgpackDecoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        socket_path = get_zmq_rpc_path_lookup(vllm_config, rpc_port_bias)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
