@@ -125,9 +125,10 @@ class KVDeliveryScheduler(Scheduler):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        self.agent_hint_manager.on_step(self.get_num_unfinished_requests())
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-
+            self.agent_hint_manager.on_request_scheduled(request)
             if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
@@ -327,7 +328,7 @@ class KVDeliveryScheduler(Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-
+                self.agent_hint_manager.on_request_scheduled(request)
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(request.status) and not self._try_promote_blocked_waiting_request(
                     request

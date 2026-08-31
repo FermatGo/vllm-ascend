@@ -356,7 +356,7 @@ class SessionAwarePoolingManager(SessionEventListener):
                     is_prefetch_req=True,
                 )
                 # 检查当前预取请求HBM命中情况
-                local_hit_req.block_hashes = tmp_prefetch_req.block_hashes
+                local_hit_req.block_hashes, _ = tmp_prefetch_req.block_hashes
                 local_blocks, local_computed_tokens = self.sam.kv_cache_manager.get_computed_blocks(local_hit_req)
 
                 # 获取本地命中block hash

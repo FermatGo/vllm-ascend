@@ -228,7 +228,7 @@ class KVPoolScheduler:
         self.keys_per_block_hash = keys_per_block_hash
 
         self.client: LookupKeyClient | None = None
-        self.client_spm | None = None
+        self.client_spm: LookupKeyClient | None = None
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
         tracker = self._request_trackers.get(req_id)
@@ -574,7 +574,7 @@ class KVPoolScheduler:
                 if self.client is None:
                     self.client = LookupKeyClient(self.vllm_config)
                 if self.client_spm is None:
-                    self.client_spm = LookupKeyClient(vllm_config, rpc_port_bias=1)
+                    self.client_spm = LookupKeyClient(self.vllm_config, rpc_port_bias=1)
                 num_external_hit_tokens = self.client.lookup(
                     token_len,
                     request.block_hashes,
