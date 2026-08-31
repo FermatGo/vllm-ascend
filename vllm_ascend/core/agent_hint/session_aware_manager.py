@@ -27,28 +27,6 @@ from vllm.v1.request import Request
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
 
 
-
-def split_base_block_hashes(
-    block_hash: BlockHashWithGroupId,
-    block_size: int,
-    hash_block_size: int,
-) -> list[BlockHash]:
-    """split KVCacheBlock block hash to request block hash"""
-    assert block_hash is not None
-    assert block_size % hash_block_size == 0
-
-    # block.block_hash 是 BlockHashWithGroupId：
-    # [拼接后的 BlockHash][4 字节 group_id]
-    merged_hash = get_block_hash(block_hash)
-
-    num_base_hashes = block_size // hash_block_size
-    assert len(merged_hash) % num_base_hashes == 0
-
-    digest_size = len(merged_hash) // num_base_hashes
-
-    return [BlockHash(merged_hash[i : i + digest_size]) for i in range(0, len(merged_hash), digest_size)]
-
-
 @dataclass
 class SessionBlockRecord:
     """单个 session 对单个 block 的引用记录（仅在 SAM 内部维护）"""
@@ -254,12 +232,7 @@ class SessionAwareManager:
                 self._add_session_block_ref(record, group_id)
 
                 if is_ephemeral:
-                    newly_protected_hashes.append(
-                        (
-                            block_id,
-                            split_base_block_hashes(block.block_hash, self.block_size[group_id], self.hash_block_size),
-                        )
-                    )
+                    newly_protected_hashes.append((block_id, block.block_hash))
                     newly_protected_ttl = ttl_expire_at
 
                 # get_new_blocks，已经把物理 block 的 session_ref_cnt 清零。
@@ -340,14 +313,7 @@ class SessionAwareManager:
                         self._add_session_block_ref(record, group_id)
 
                         # self._ttl_manager.update(block_id, session_id, new_expire_at)
-                        newly_protected_hashes.append(
-                            (
-                                block_id,
-                                split_base_block_hashes(
-                                    block.block_hash, self.block_size[group_id], self.hash_block_size
-                                ),
-                            )
-                        )
+                        newly_protected_hashes.append((block_id, block.block_hash))
                         newly_protected_ttl = new_expire_at
 
                         # 一个 block 可能被多个 session 引用，block metadata 应使用
@@ -372,14 +338,7 @@ class SessionAwareManager:
                     self._add_session_block_ref(record, group_id)
 
                     if is_ephemeral:
-                        newly_protected_hashes.append(
-                            (
-                                block_id,
-                                split_base_block_hashes(
-                                    block.block_hash, self.block_size[group_id], self.hash_block_size
-                                ),
-                            )
-                        )
+                        newly_protected_hashes.append((block_id, block.block_hash))
                         newly_protected_ttl = requested_expire_at
 
                         block_expire_at = max(
@@ -565,9 +524,6 @@ class SessionAwareManager:
                 if record.is_ephemeral:
                     self._ttl_manager.remove(block_id=block_id, session_id=session_id, is_notify_spm=False)
 
-                    # affected_block_hashes.extend(
-                    #     split_base_block_hashes(record.block_hash, self.block_size[group_id], self.hash_block_size))
-
                 self._remove_session_block_ref(session_id, block_id, group_id)
 
                 remaining_records = self._block_sessions[group_id].get(block_id, {}).values()
@@ -633,9 +589,6 @@ class SessionAwareManager:
                     record = cur_block_session.get(session_id)
                     if len(cur_block_session) == 0 or record is None:
                         continue
-
-                    # affected_block_hashes.extend(
-                    #     split_base_block_hashes(record.block_hash, self.block_size[group_id], self.hash_block_size))
 
                     self._remove_session_block_ref(session_id, block_id, group_id)
 
