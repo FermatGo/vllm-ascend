@@ -6,6 +6,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from collections import OrderedDict
+from enum import IntEnum
 
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -97,6 +99,16 @@ class SessionAwareManager:
         # TTL 管理器（定时轮）
         self._ttl_manager = TTLManager(on_expired=self._on_ttl_expired, notify_func=self._notify_event)
 
+        # 事件监听器列表
+        self._event_listeners: list[SessionEventListener] = []
+
+        # session state manager
+        self._session_state_manager = SessionStateManager(
+            max_sessions=10,
+            on_offload=lambda hashes: self._notify_event("context_management_offload", block_hashes=hashes),
+            on_evict=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes),
+        )
+
         # Session 控制器
         self._session_controller = SessionController(
             execute_offload=self._execute_offload,
@@ -104,16 +116,9 @@ class SessionAwareManager:
             execute_evict=self._execute_evict,
             get_global_block_id_by_session=self._get_session_global_block_ids,
             get_block_hashes_by_session=self._get_session_block_hash,
-        )
-
-        # 事件监听器列表
-        self._event_listeners: list[SessionEventListener] = []
-
-    def tick(self) -> None:
-        self._ttl_manager.tick()
-
-    def on_request_completed(self, request_id: str) -> None:
-        self._session_controller.on_request_completed(request_id)
+            ssm_process_offload=self._session_state_manager.process_offload_hashes,
+            ssm_process_evict=self._session_state_manager.process_evict_hashes,
+          )
 
     def on_blocks_allocated_for_request(
         self, request: Request, blocks: KVCacheBlocks, cached_blocks_len_before: tuple[int, ...] | None = None
@@ -506,9 +511,9 @@ class SessionAwareManager:
         block_ids_all_group: tuple[list[int], ...],
         is_session: bool,
     ) -> int:
-        """卸载指定范围的 block — 减少 session 引用 + 清除当前session的TTL（通知TTLManager）"""
+        """卸载指定范围的 block — 减少 session 引用 + 清除当前session的TTL（通知TTLManager）,仅操作 SAM 本地 HBM 数据。"""
         affected_block_hashes: list[BlockHash] = []
-
+        update_count = 0
         for group_id in range(self.num_kv_cache_groups - 1, -1, -1):
             assert self.block_size[group_id] % self.hash_block_size == 0, (
                 f"block_size {self.block_size[group_id]} is not a multiple of {self.hash_block_size}"
@@ -538,17 +543,19 @@ class SessionAwareManager:
                     ttl_expire_at=latest_ttl_expire_at,
                     is_offload_block=True,
                 )
+                update_count += 1
 
-        block_start_e, block_end_e = self._expand_session_block_range(session_id, block_start, block_end)
-        affected_block_hashes.extend(self._session_block_hash.get(session_id, [])[block_start_e:block_end_e])
+        if update_count:
+            block_start_e, block_end_e = self._expand_session_block_range(session_id, block_start, block_end)
+            affected_block_hashes.extend(self._session_block_hash.get(session_id, [])[block_start_e:block_end_e])
         res = len(affected_block_hashes)
 
-        self._ttl_manager.register(
-            block_infos=[],
-            session_id=session_id,
-            expire_at=time.monotonic() + 3600,
-            protected_block_hashes=affected_block_hashes,
-        )
+        # self._ttl_manager.register(
+        #     block_infos=[],
+        #     session_id=session_id,
+        #     expire_at=time.monotonic() + 3600,
+        #     protected_block_hashes=affected_block_hashes,
+        # )
 
         return res
 
@@ -574,7 +581,6 @@ class SessionAwareManager:
         """驱逐指定范围的 block — 减少引用 + 清除当前session的TTL
         清除本地引用，并通知 SPM 停止对应远端 PoolKey 的 Keep-Alive
         """
-        res = 0
         if not is_session:
             affected_block_hashes: list[BlockHash] = []
 
@@ -733,6 +739,16 @@ class SessionAwareManager:
         """注册事件监听器（SPM 调用）"""
         self._event_listeners.append(listener)
 
+    def process_prefetch_req(self, num_unfinished_requests: int) -> None:
+        """统一 prefetch 入口：调 SPM 处理预取，然后更新 SSM hash 位置为 HBM。"""
+        for listener in tuple(self._event_listeners):
+            handler = getattr(listener, "process_prefetch_req", None)
+            if handler is not None:
+                results = handler(num_unfinished_requests)
+                for session_id, block_hashes in results:
+                    self._session_state_manager.process_prefetch_hashes(session_id, block_hashes)
+                break
+
     def _notify_event(self, event_type: str, **kwargs):
         """通知所有监听器"""
         ret = 0
@@ -751,6 +767,17 @@ class SessionAwareManager:
                 )
         return ret
 
+    def on_request_completed(self, request_id: str, session_id: str | None) -> None:
+        """请求完成回调 — 处理挂起 edits 并通知 SSM 会话不再活跃"""
+        self._session_controller.on_request_completed(request_id)
+        if session_id:
+            self._session_state_manager.mark_session_inactive(session_id)
+
+    def tick(self, now: float | None = None) -> None:
+        """推进 TTL timer wheel，并在 LRU 满时尝试淘汰 session。由 scheduler 统一调用。"""
+        self._ttl_manager.tick(now)
+        self._session_state_manager._try_evict_if_needed()
+
     def register_agent_hint(
         self,
         request_id: str,
@@ -762,8 +789,9 @@ class SessionAwareManager:
         return self._session_controller.process_request_edits(request_id, session_id, context_management)
 
     def register_session_block_hash(self, session_id: str, block_hashes: list[BlockHash]) -> None:
-        """register session block hash to session aware manager"""
+        """register session block hash to session aware manager and session state manager"""
         self._session_block_hash[session_id] = block_hashes
+        self._session_state_manager.set_session_block_hashes(session_id, block_hashes)
 
     def _get_block(self, block_id: int) -> KVCacheBlock:
         return self.kv_cache_manager.block_pool.blocks[block_id]
@@ -1158,11 +1186,18 @@ class SessionController:
         execute_evict: Callable[..., int],
         get_global_block_id_by_session: Callable[[str, int, int], tuple[list[int], ...]],
         get_block_hashes_by_session: Callable[[str, int, int], list[BlockHash]],
+        ssm_process_offload=Callable[..., None],
+        ssm_process_evict=Callable[..., None],
+
     ):
-        self._execute_callbacks: dict[str, Callable[..., int]] = {
+        self._execute_sam_callbacks: dict[str, Callable[..., int]] = {
             "offload": execute_offload,
             "prefetch": execute_prefetch,
             "evict": execute_evict,
+        }
+        self._execute_ssm_callbacks: dict[str, Callable[..., None]] = {
+            "offload": ssm_process_offload,
+            "evict": ssm_process_evict,
         }
         self._get_global_block_id_by_session = get_global_block_id_by_session
         self._get_block_hashes_by_session = get_block_hashes_by_session
@@ -1287,7 +1322,7 @@ class SessionController:
             f"(block_start={edit.block_start}, block_end={edit.block_end})."
         )
 
-        fn = self._execute_callbacks.get(edit.type)
+        fn = self._execute_sam_callbacks.get(edit.type)
         if fn is None:
             logger.warning("No callback registered for edit type: %s, skipping.", edit.type)
             return EditResponse(
@@ -1305,21 +1340,25 @@ class SessionController:
         op_result, fail_reason = self.process_edit_index(edit, total_block_length, session_id)
 
         if op_result:
+            # ── SSM 侧处理（远端状态更新） ──
+            fn = self._execute_ssm_callbacks.get(edit.type)
+            if fn is None:
+                fn(session_id, edit.block_start, edit.block_end,
+                    is_session=is_session_op,)
+            # ── SAM 侧处理（HBM block） ──
             if edit.type == "prefetch":
                 get_block_info_fn = self._get_block_hashes_by_session
-            else:
-                get_block_info_fn = self._get_global_block_id_by_session
-            process_session_block_info = get_block_info_fn(session_id, edit.block_start, edit.block_end)
-            process_num = 0
-            for info in process_session_block_info:
-                process_num += len(info)
-            logger.info(f"session {session_id} session hash or block id count {process_num}")
-            if edit.type == "prefetch":
+                process_session_block_info = get_block_info_fn(session_id, edit.block_start, edit.block_end)
+                process_num = sum(len(info) for info in process_session_block_info)
+                logger.info(f"session {session_id} hash count {process_num}")
                 actual_process_blocks = fn(session_id, process_session_block_info, is_session_op)
             else:
-                actual_process_blocks = fn(
-                    session_id, edit.block_start, edit.block_end, process_session_block_info, is_session_op
-                )
+                get_block_info_fn = self._get_global_block_id_by_session
+                process_session_block_info = get_block_info_fn(session_id, edit.block_start, edit.block_end)
+                process_num = sum(len(info) for info in process_session_block_info)
+                logger.info(f"session {session_id} block id count {process_num}")
+                actual_process_blocks = fn(session_id, edit.block_start, edit.block_end, process_session_block_info,
+                                           is_session_op)
 
         return EditResponse(
             session_id=session_id,
@@ -1379,3 +1418,430 @@ def compute_ephemeral_range(
         block_offset=block_offset,
         ttl=cache_control.ttl,
     )
+
+class CacheLevel(IntEnum):
+    HBM = 0
+    DDR = 1
+    SSD = 2
+
+
+def _get_bottom_level(num_cache_levels: int) -> CacheLevel:
+    """Return the bottom-most CacheLevel given a configurable number of levels.
+
+    2 levels → HBM, DDR (SSD excluded, bottom=DDR)
+    3 levels → HBM, DDR, SSD  (bottom=SSD)
+    """
+    if num_cache_levels == 2:
+        return CacheLevel.DDR
+    return CacheLevel.SSD
+
+
+@dataclass
+class BlockHashState:
+    """单个 block hash 的完整状态 — 被引用状态 + 缓存位置"""
+    block_hash: BlockHash
+    ref_count: int = 0
+    ref_sessions: set[str] = field(default_factory=set)
+    location: CacheLevel = CacheLevel.HBM
+    offload_count: int = 0
+
+    # ── 引用计数操作 ──────────────────────────────────────────────
+
+    def add_ref(self, session_id: str, hashes_by_level: dict[CacheLevel, set[BlockHash]]) -> bool:
+        """增加一个 session 引用。如果 hash 不在 HBM，重置到 HBM。返回是否发生了位置重置。"""
+        self.ref_count += 1
+        self.ref_sessions.add(session_id)
+        if self.location != CacheLevel.HBM:
+            hashes_by_level[self.location].discard(self.block_hash)
+            hashes_by_level[CacheLevel.HBM].add(self.block_hash)
+            self.location = CacheLevel.HBM
+            self.offload_count = 0
+            return True  # was reset from lower level to HBM
+        return False  # already in HBM
+
+    def remove_ref(self, session_id: str, hashes_by_level: dict[CacheLevel, set[BlockHash]]) -> bool:
+        """减少一个 session 引用。ref 归零时自动从 hashes_by_level 移除。返回是否已完全释放。"""
+        self.ref_count -= 1
+        self.ref_sessions.discard(session_id)
+        if self.ref_count == 0:
+            hashes_by_level[self.location].discard(self.block_hash)
+            return True  # fully released
+        return False
+
+    # ── 缓存位置操作 ──────────────────────────────────────────────
+
+    def set_location(
+        self, new_location: CacheLevel, new_offload_count: int,
+        hashes_by_level: dict[CacheLevel, set[BlockHash]],
+    ) -> None:
+        """更新缓存位置，同步维护 hashes_by_level 的跨层迁移。"""
+        if self.location != new_location:
+            hashes_by_level[self.location].discard(self.block_hash)
+            hashes_by_level[new_location].add(self.block_hash)
+        self.location = new_location
+        self.offload_count = new_offload_count
+
+    # ── 查询 ──────────────────────────────────────────────────────
+
+    def is_shared_with_active_session(self, requesting_session: str, is_active_fn) -> bool:
+        """判断 hash 是否被其他活跃 session 共享（多 session 保护检查）。"""
+        if self.ref_count <= 1:
+            return False
+        other_sessions = self.ref_sessions - {requesting_session}
+        return any(is_active_fn(sid) for sid in other_sessions)
+
+@dataclass
+class EvictedSessionInfo:
+    """LRU 淘汰结果"""
+    session_id: str
+    freed_hashes: list[BlockHash]
+    still_shared_hashes: list[BlockHash]
+
+class SessionStateManager:
+    """Manages block hash state, cache levels, and LRU eviction."""
+
+    def __init__(
+        self,
+        max_sessions: int = 1000,
+        num_cache_levels: int = 3,
+        *,
+        on_offload: Callable[[list[BlockHash]], None] | None = None,
+        on_evict: Callable[[list[BlockHash]], int | None] | None = None,
+    ):
+        self.num_cache_levels = num_cache_levels
+        self._bottom_level = _get_bottom_level(num_cache_levels)
+        self._session_block_hash: dict[str, list[BlockHash]] = {}
+        self._global_hash_state: dict[BlockHash, BlockHashState] = {}
+        # Only create dict entries for configured cache levels
+        self._hashes_by_level: dict[CacheLevel, set[BlockHash]] = {
+            level: set()
+            for level in CacheLevel
+            if level.value < num_cache_levels
+        }
+        self._lru: OrderedDict[str, float] = OrderedDict()
+        self._session_hash_count: dict[str, int] = {}
+        self._active_session_ids: set[str] = set()  # Sessions with active requests
+        self.max_sessions = max_sessions
+
+        # SPM callbacks for context management notifications
+        self._on_offload = on_offload
+        self._on_evict = on_evict
+
+    # ════════════════════════════════════════════════════════════════
+    # Active session tracking (notified by SAM on request alloc/free)
+    # ════════════════════════════════════════════════════════════════
+
+    def mark_session_active(self, session_id: str) -> None:
+        """Mark session as having active requests."""
+        if session_id not in self._active_session_ids:
+            logger.info("SSM: mark_session_active [%s]", session_id)
+            self._active_session_ids.add(session_id)
+
+    def mark_session_inactive(self, session_id: str) -> None:
+        """Mark session as having no active requests."""
+        if session_id in self._active_session_ids:
+            logger.info("SSM: mark_session_inactive [%s]", session_id)
+            self._active_session_ids.discard(session_id)
+
+    def _is_session_active(self, session_id: str) -> bool:
+        """Check if the session currently has active requests."""
+        return session_id in self._active_session_ids
+
+    def set_session_block_hashes(
+        self, session_id: str, new_hashes: list[BlockHash],
+    ) -> None:
+        """Overwrite the session's block hash list (no diff). Session is guaranteed active at this point."""
+        old_hashes = self._session_block_hash.get(session_id, [])
+        if old_hashes == new_hashes:
+            logger.debug("SSM: set_session_block_hashes [%s] unchanged %d hashes, skipped",
+                          session_id, len(old_hashes))
+            self.mark_session_active(session_id)
+            self._touch_lru(session_id)
+            return
+
+        logger.info("SSM: set_session_block_hashes [%s] %d -> %d hashes",
+                     session_id, len(old_hashes), len(new_hashes))
+
+        for h in old_hashes:
+            self._unregister_hash(h, session_id)
+
+        # Register new hashes
+        new_count = 0
+        reset_count = 0
+        for h in new_hashes:
+            if h in self._global_hash_state:
+                if self._global_hash_state[h].add_ref(session_id, self._hashes_by_level):
+                    reset_count += 1
+            else:
+                self._global_hash_state[h] = BlockHashState(
+                    block_hash=h, ref_count=1, ref_sessions={session_id},
+                    location=CacheLevel.HBM, offload_count=0,
+                )
+                self._hashes_by_level[CacheLevel.HBM].add(h)
+                new_count += 1
+
+        self._session_block_hash[session_id] = new_hashes
+        self._session_hash_count[session_id] = len(new_hashes)
+        logger.info("SSM: set_session_block_hashes [%s] %d new global entries, %d reset to HBM, total managed hashes=%d",
+                      session_id, new_count, reset_count, len(self._global_hash_state))
+        self.mark_session_active(session_id)
+        self._touch_lru(session_id)
+
+    def _unregister_hash(self, block_hash: BlockHash, session_id: str) -> bool:
+        """Unregister a session's reference to a hash. Returns True if the hash was fully freed."""
+        state = self._global_hash_state.get(block_hash)
+        if state is None:
+            return False
+        if state.remove_ref(session_id, self._hashes_by_level):
+            del self._global_hash_state[block_hash]
+            return True
+        return False
+
+    def _batch_update_locations(
+        self, updates: list[tuple[BlockHash, CacheLevel, int]]
+    ) -> None:
+        for block_hash, new_location, new_offload_count in updates:
+            state = self._global_hash_state.get(block_hash)
+            if state is None:
+                continue
+            state.set_location(new_location, new_offload_count, self._hashes_by_level)
+        logger.info("SSM: _batch_update_locations %d hashes updated", len(updates))
+
+    def _get_hashes_with_locations(
+        self, session_id: str, start: int, end: int,
+    ) -> list[tuple[BlockHash, CacheLevel, int]]:
+        hashes = self._session_block_hash.get(session_id, [])
+        if not hashes:
+            return []
+        if end == -1:
+            end = len(hashes)
+        start = max(0, start)
+        end = min(end, len(hashes))
+        if start >= end:
+            return []
+        result = []
+        for h in hashes[start:end]:
+            state = self._global_hash_state.get(h)
+            if state is not None:
+                result.append((h, state.location, state.offload_count))
+            else:
+                result.append((h, CacheLevel.HBM, 0))
+        return result
+
+    def _filter_hashes_with_active_share(
+        self, hashes: list[BlockHash], requesting_session: str,
+    ) -> list[BlockHash]:
+        filtered = []
+        for h in hashes:
+            state = self._global_hash_state.get(h)
+            if state is None or not state.is_shared_with_active_session(requesting_session, self._is_session_active):
+                filtered.append(h)
+        return filtered
+
+    def process_offload_hashes(
+        self, session_id: str, block_start: int, block_end: int,
+        **kwargs,
+    ) -> None:
+        """SSM-side offload: sink hash locations down one level, notify SPM."""
+        hashes_with_locs = self._get_hashes_with_locations(
+            session_id, block_start, block_end)
+        if not hashes_with_locs:
+            logger.info("SSM: process_offload_hashes [%s] no hashes in [%d, %d)", session_id, block_start, block_end)
+            return
+        logger.info("SSM: process_offload_hashes [%s] %d hashes in [%d, %d)",
+                     session_id, len(hashes_with_locs), block_start, block_end)
+
+        ssm_updates: list[tuple[BlockHash, CacheLevel, int]] = []
+        bottom_skipped = 0
+        for h, loc, cnt in hashes_with_locs:
+            state = self._global_hash_state.get(h)
+            if state is None:
+                continue
+            # Multi-session protection: skip hashes referenced by other active sessions
+            if state.is_shared_with_active_session(session_id, self._is_session_active):
+                continue
+            if loc >= self._bottom_level:
+                bottom_skipped += 1
+                continue
+            new_loc = CacheLevel(loc + 1)
+            new_cnt = cnt + 1
+            ssm_updates.append((h, new_loc, new_cnt))
+
+        if ssm_updates:
+            self._batch_update_locations(ssm_updates)
+            # 统计各级 cache 的分布
+            level_counts: dict[CacheLevel, int] = {}
+            for _, new_loc, _ in ssm_updates:
+                level_counts[new_loc] = level_counts.get(new_loc, 0) + 1
+            level_summary = ", ".join(f"{k.name}={v}" for k, v in sorted(level_counts.items()))
+            msg = f"SSM: process_offload_hashes [{session_id}] {len(ssm_updates)} hashes [{level_summary}]"
+            if bottom_skipped:
+                msg += f", {bottom_skipped} already at bottom"
+            logger.info(msg)
+            self._touch_lru(session_id)
+            if self._on_offload is not None:
+                offloaded_hashes = [h for h, _, _ in ssm_updates]
+                self._on_offload(offloaded_hashes)
+        elif bottom_skipped:
+            logger.info("SSM: process_offload_hashes [%s] no offloadable hashes, %d already at bottom",
+                         session_id, bottom_skipped)
+
+    def process_evict_hashes(
+        self, session_id: str, block_start: int = 0, block_end: int = -1,
+        is_session: bool = False,
+    ) -> None:
+        """SSM-side evict: unregister hash references, notify SPM.
+
+        - Session evict: unregister all hashes and clean up LRU state
+        - Range evict: unregister hashes in [block_start, block_end)
+        Callback only receives hashes that were fully freed (ref_count reached 0).
+        """
+        if is_session:
+            self._process_session_evict(session_id)
+        else:
+            self._process_range_evict(session_id, block_start, block_end)
+
+    def _process_session_evict(self, session_id: str) -> None:
+        """Evict all hashes for a session and remove from LRU. Only freed hashes in callback."""
+        if not self._is_session_managed(session_id):
+            logger.info("SSM: process_evict_hashes [%s] session evict skipped, already evicted from LRU", session_id)
+            return
+        logger.info("SSM: process_evict_hashes [%s] session evict", session_id)
+        results = self._evict_lru_sessions([session_id])
+        if self._on_evict is not None and results:
+            self._on_evict(results[0].freed_hashes)
+
+    def _process_range_evict(
+        self, session_id: str, block_start: int, block_end: int,
+    ) -> None:
+        """Evict a range of hashes for a session. Only freed hashes in callback."""
+        hashes_with_locs = self._get_hashes_with_locations(
+            session_id, block_start, block_end)
+        if not hashes_with_locs:
+            logger.warning("SSM: process_evict_hashes [%s] no hashes in [%d, %d)",
+                         session_id, block_start, block_end)
+            return
+
+        target_hashes = [h for h, _, _ in hashes_with_locs]
+        safe_hashes = self._filter_hashes_with_active_share(target_hashes, session_id)
+        shared_count = len(target_hashes) - len(safe_hashes)
+
+        if not safe_hashes:
+            logger.warning("SSM: process_evict_hashes [%s] all %d hashes protected by active sessions",
+                         session_id, len(target_hashes))
+            return
+
+        # Unregister and separate freed vs. still-shared
+        freed_hashes: list[BlockHash] = []
+        still_shared_count = 0
+        for h in safe_hashes:
+            if self._unregister_hash(h, session_id):
+                freed_hashes.append(h)
+            else:
+                still_shared_count += 1
+
+        logger.info("SSM: process_evict_hashes [%s] %d freed, %d still shared (filtered from %d target, %d active-share protected)",
+                     session_id, len(freed_hashes), still_shared_count,
+                     len(target_hashes), shared_count)
+
+        # Touch LRU if session still has remaining hashes
+        if session_id in self._session_block_hash and self._session_block_hash[session_id]:
+            self._touch_lru(session_id)
+
+        if self._on_evict is not None and freed_hashes:
+            self._on_evict(freed_hashes)
+
+    def touch_lru(self, session_id: str) -> None:
+        """Move session to the end of the LRU list (most recently used)."""
+        if session_id in self._lru:
+            self._lru.move_to_end(session_id)
+        else:
+            self._lru[session_id] = time.monotonic()
+            logger.info("SSM: touch_lru [%s] newly tracked in LRU (total=%d)",
+                         session_id, len(self._lru))
+
+    def _touch_lru(self, session_id: str) -> None:
+        self.touch_lru(session_id)
+
+    def process_prefetch_hashes(
+        self, session_id: str, block_hashes: list[BlockHash],
+    ) -> None:
+        """SSM-side prefetch: reset hash locations to HBM.
+
+        SPM 在真正预取后调用。对每个 hash 更新位置到 HBM；
+        如果 session 在 SSM 中无记录（被 LRU 淘汰过），自动重建。
+        """
+        session_known = session_id in self._session_block_hash
+
+        for h in block_hashes:
+            state = self._global_hash_state.get(h)
+            if state is not None:
+                state.set_location(CacheLevel.HBM, 0, self._hashes_by_level)
+            else:
+                self._global_hash_state[h] = BlockHashState(
+                    block_hash=h, ref_count=1, ref_sessions={session_id},
+                    location=CacheLevel.HBM, offload_count=0,
+                )
+                self._hashes_by_level[CacheLevel.HBM].add(h)
+
+        if not session_known:
+            self._session_block_hash[session_id] = block_hashes.copy()
+            self._session_hash_count[session_id] = len(block_hashes)
+            logger.info("SSM: process_prefetch_hashes [%s] new session with %d hashes",
+                         session_id, len(block_hashes))
+        else:
+            logger.info("SSM: process_prefetch_hashes [%s] reset %d hashes to HBM",
+                         session_id, len(block_hashes))
+        self._touch_lru(session_id)
+
+    def _get_evict_candidates(
+        self, count: int = 1, active_session_ids: set[str] | None = None,
+    ) -> list[str]:
+        active = active_session_ids or set()
+        # 从 inactive 中按 hash_count 升序 + LRU 年龄排序
+        # _lru 迭代顺序：越靠前越老（最早 touch 或最早添加）
+        candidates = [sid for sid in self._lru if sid not in active]
+        # 相同 hash_count 时 stable sort 保持 _lru 顺序（老的在前）
+        candidates.sort(key=lambda sid: self._session_hash_count.get(sid, 0))
+        return candidates[:count]
+
+    def _try_evict_if_needed(self) -> None:
+        if len(self._lru) < self.max_sessions:
+            return
+        candidates = self._get_evict_candidates(count=1)
+        if candidates:
+            logger.info("SSM: _try_evict_if_needed LRU full (%d >= %d), evicting [%s]",
+                         len(self._lru), self.max_sessions, candidates[0])
+            self._evict_lru_sessions(session_ids=candidates)
+
+    def _evict_lru_sessions(self, session_ids: list[str]) -> list[EvictedSessionInfo]:
+        results = []
+        for session_id in session_ids:
+            if session_id not in self._lru:
+                continue
+            hashes = self._session_block_hash.get(session_id, [])
+            freed_hashes: list[BlockHash] = []
+            still_shared_hashes: list[BlockHash] = []
+            for h in hashes:
+                state = self._global_hash_state.get(h)
+                if state is None:
+                    continue
+                if state.remove_ref(session_id, self._hashes_by_level):
+                    del self._global_hash_state[h]
+                    freed_hashes.append(h)
+                else:
+                    still_shared_hashes.append(h)
+            self._session_block_hash.pop(session_id, None)
+            self._session_hash_count.pop(session_id, None)
+            self._lru.pop(session_id, None)
+            results.append(EvictedSessionInfo(
+                session_id=session_id, freed_hashes=freed_hashes,
+                still_shared_hashes=still_shared_hashes,
+            ))
+            logger.info("SSM: evicted session [%s] (%d hashes: %d freed, %d still shared)",
+                         session_id, len(hashes), len(freed_hashes), len(still_shared_hashes))
+        return results
+
+    def _is_session_managed(self, session_id: str) -> bool:
+        return session_id in self._lru
+

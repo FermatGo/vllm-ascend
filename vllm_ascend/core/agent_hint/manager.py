@@ -85,11 +85,12 @@ class AscendAgentHintManager(AgentHintManager):
 
     def on_step(self, num_unfinished_requests: int) -> None:
         self._session_manager.tick()
-        if self._pooling_manager is not None:
-            self._pooling_manager.process_prefetch_req(num_unfinished_requests=num_unfinished_requests)
+        self._session_manager.process_prefetch_req(num_unfinished_requests=num_unfinished_requests)
 
     def on_request_finished(self, request: Request) -> None:
-        self._session_manager.on_request_completed(request.request_id)
+        hint = convert_agent_hint_dict(request.agent_hint)
+        session_id = hint.session_id if hint is not None else None
+        self._session_manager.on_request_completed(request.request_id, session_id)
 
     def has_pending_work(self) -> bool:
         return bool(self._pooling_manager and self._pooling_manager.prefetch_waiting_queue)

@@ -301,7 +301,9 @@ class SessionAwarePoolingManager(SessionEventListener):
     ) -> int:
         return self.on_session_blocks_removed(session_id, block_hashes)
 
-    def process_prefetch_req(self, num_unfinished_requests: int):
+    def process_prefetch_req(self, num_unfinished_requests: int) -> list[tuple[str, list[BlockHash]]]:
+        """处理预取请求，返回 [(session_id, prefetched_block_hashes), ...] 供 SAM 更新 SSM。"""
+        prefetch_results: list[tuple[str, list[BlockHash]]] = []
         # 处理上一轮次prefetch
         for i in range(0, len(self.prefetch_running_queue)):
             free_prefetch_running_req = self.prefetch_running_queue[i]
@@ -397,6 +399,7 @@ class SessionAwarePoolingManager(SessionEventListener):
                     logger.debug(f"new_blocks is {new_blocks} ids {tmp_prefetch_req.dest_block_ids}")
                     if total_external_matched_tokens > 0:
                         self._submit_prefetch_to_scheduler(tmp_prefetch_req, total_external_matched_tokens)
+                    prefetch_results.append((tmp_prefetch_req.session_id, total_hit_block_hashes))
                     self.prefetch_running_queue.append(tmp_req)
             except Exception as e:
                 logger.error("Prefetch failed for request %s: %s", tmp_prefetch_req.request_id, e)
@@ -415,6 +418,7 @@ class SessionAwarePoolingManager(SessionEventListener):
             logger.info(
                 f"adding company req for unfinish req {num_unfinished_requests} and prefetch count {len(self.prefetch_running_queue)}"
             )
+        return prefetch_results
 
 
 class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
