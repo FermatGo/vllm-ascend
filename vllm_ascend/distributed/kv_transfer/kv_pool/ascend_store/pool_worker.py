@@ -2504,3 +2504,80 @@ class KVPoolWorker:
             if ce := self.kv_send_thread.get_completed_events():
                 return AscendStoreKVConnectorWorkerMetadata(ce)
         return None
+
+    def remove(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        kv_cache_group_ids: list[int] | None = None,
+        use_layerwise: bool = False,
+        lazy: bool = False
+    ) -> None:
+        """
+        Remove the KV cache of the given tokens from the external pool.
+ 
+        Generates the same keys as `lookup_scheduler` (including multi-TP and
+        PP replicas) and deletes them from the storage backend.
+ 
+        :param token_len: the number of tokens of the corresponding KV caches.
+        :param block_hashes: the block hashes of the KV cache to remove.
+        :param kv_cache_group_ids: the KV cache group ids to remove.
+        :param use_layerwise: whether to remove layerwise keys.
+ 
+        :return: the number of keys submitted for removal.
+        """
+        try:
+            keys: list[str] = []
+            kv_cache_group_ids = kv_cache_group_ids or [0]
+            for group_id in kv_cache_group_ids:
+                group_keys: list[str] = []
+                for _, _, key in self.token_database.process_tokens(
+                    token_len,
+                    block_hashes,
+                    kv_cache_group_id=group_id,
+                ):
+                    if use_layerwise:
+                        keys_multi_layer = key.split_layers(self.num_layers)
+                        group_keys.extend(item.to_string() for item in keys_multi_layer)
+                    else:
+                        group_keys.append(key.to_string())
+ 
+                if not group_keys:
+                    continue
+ 
+                multi_tp_keys = group_keys[:]
+                group_tp_size = min(self.tp_size, self._get_group_num_kv_heads(group_id))
+                for i in range(1, group_tp_size):
+                    for item in group_keys:
+                        multi_tp_keys.append(
+                            item.replace(  # type: ignore[attr-defined]
+                                "@head_or_tp_rank:0", f"@head_or_tp_rank:{i}", 1
+                            )
+                        )
+ 
+                for i in range(1, self.pp_size):
+                    for item in multi_tp_keys:
+                        keys.append(
+                            item.replace(  # type: ignore[attr-defined]
+                                "@pp_rank:0", f"@pp_rank:{i}", 1
+                            )
+                        )
+                keys.extend(multi_tp_keys)
+ 
+            if not keys:
+                return
+            logger.debug(
+                "KV pool worker removes request token_len=%d groups=%s keys=%d sample_keys=%s",
+                token_len,
+                kv_cache_group_ids,
+                len(keys),
+                keys[:3],
+            )
+            remove_fn = getattr(self.m_store, "remove", None)
+            if remove_fn is not None:
+                res = remove_fn(keys, lazy)
+                logger.debug(f"KVPoolWorker.remove: nums of block hash: {len(block_hashes)}, results: {res}")
+            return
+        except Exception as e:
+            logger.error("Failed to remove KV pool keys: %s", e)
+            return

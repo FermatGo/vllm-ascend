@@ -34,6 +34,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     block_hash_to_bytes,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
+    RPC_OP_REMOVE,
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
 )
@@ -131,6 +132,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
                 self.spm_lookup_server = LookupKeyServer(self.connector_worker, vllm_config, rpc_port_bias=1)
+                self.spm_remove_server = LookupKeyServer(self.connector_worker, vllm_config, rpc_port_bias=2)
 
     ############################################################
     # Scheduler Side Methods
@@ -285,6 +287,15 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 
+    def remove(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        lazy: bool = False,
+    ) -> None:
+        """Remove keys from the external KV cache."""
+        self.connector_scheduler.remove(token_len, block_hashes, lazy)
+
     def get_kv_connector_kv_cache_events(self) -> AscendStoreKVEvents | None:
         """
         Get the KV connector kv cache events collected during the last interval.
@@ -333,24 +344,43 @@ class LookupKeyServer:
         def process_request():
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
-                token_len = int.from_bytes(all_frames[0], byteorder="big")
-                kv_group_ids = self.decoder.decode([all_frames[1]])
-                hbm_hit_tokens = int.from_bytes(all_frames[2], byteorder="big")
-                hashes_str = self.decoder.decode(all_frames[3:])
-                block_hashes = [BlockHash(block_hash_to_bytes(block_hash)) for block_hash in hashes_str]
-                result = self.pool_worker.lookup_scheduler(
-                    token_len,
-                    block_hashes,
-                    kv_group_ids,
-                    use_layerwise=False,
-                    hbm_hit_tokens=hbm_hit_tokens,
-                )
-                logger.debug(
-                    "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
-                    token_len,
-                    kv_group_ids,
-                    result,
-                )
+                opcode = bytes(all_frames[0])[:1]
+                logger.debug(f"LookupKeyServer: opcode: {opcode}")
+                if opcode == RPC_OP_REMOVE:
+                    token_len = int.from_bytes(all_frames[1], byteorder="big")
+                    lazy = bool(int.from_bytes(all_frames[2], byteorder="big"))
+                    kv_group_ids = self.decoder.decode([all_frames[3]])
+                    hbm_hit_tokens = int.from_bytes(all_frames[4], byteorder="big")
+                    hashes_str = self.decoder.decode(all_frames[5:])
+                    block_hashes = [BlockHash(block_hash_to_bytes(block_hash)) for block_hash in hashes_str]
+                    self.pool_worker.remove(
+                        token_len,
+                        block_hashes,
+                        kv_group_ids,
+                        self.use_layerwise,
+                        lazy,
+                    )
+                    logger.debug(f"LookupKeyService: remove token_len:{token_len}, kv_group_ids: {kv_group_ids}, hashes: {block_hashes}")
+                    result = 0
+                else:
+                    token_len = int.from_bytes(all_frames[1], byteorder="big")
+                    kv_group_ids = self.decoder.decode([all_frames[2]])
+                    hbm_hit_tokens = int.from_bytes(all_frames[3], byteorder="big")
+                    hashes_str = self.decoder.decode(all_frames[4:])
+                    block_hashes = [BlockHash(block_hash_to_bytes(block_hash)) for block_hash in hashes_str]
+                    result = self.pool_worker.lookup_scheduler(
+                        token_len,
+                        block_hashes,
+                        kv_group_ids,
+                        use_layerwise=False,
+                        hbm_hit_tokens=hbm_hit_tokens,
+                    )
+                    logger.debug(
+                        "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
+                        token_len,
+                        kv_group_ids,
+                        result,
+                    )
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 

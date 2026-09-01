@@ -55,6 +55,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
 )
 
 
+RPC_OP_LOOKUP = b"L"
+RPC_OP_REMOVE = b"R"
+
+
 class KVPoolScheduler:
     def __init__(
         self,
@@ -229,6 +233,7 @@ class KVPoolScheduler:
 
         self.client: LookupKeyClient | None = None
         self.client_spm: LookupKeyClient | None = None
+        self.client_spm_remove: LookupKeyClient | None = None
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
         tracker = self._request_trackers.get(req_id)
@@ -575,6 +580,8 @@ class KVPoolScheduler:
                     self.client = LookupKeyClient(self.vllm_config)
                 if self.client_spm is None:
                     self.client_spm = LookupKeyClient(self.vllm_config, rpc_port_bias=1)
+                if self.client_spm_remove is None:
+                    self.client_spm_remove = LookupKeyClient(self.vllm_config, rpc_port_bias=2)
                 num_external_hit_tokens = self.client.lookup(
                     token_len,
                     request.block_hashes,
@@ -1124,6 +1131,27 @@ class KVPoolScheduler:
             else:
                 self.sending_events[event_id] = total
 
+    def remove(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        lazy: bool = False,
+    ) -> None:
+        """
+        Remove the KV cache chunks matching the given tokens and block hashes
+        from the external KV pool.
+ 
+        The removal is delegated to the pool worker via the lookup RPC channel.
+        Returns the number of keys submitted for removal.
+        """
+        self.client_spm_remove.remove(
+            token_len,
+            block_hashes,
+            self.kv_cache_group_ids,
+            lazy
+        )
+        return
+
     def request_finished(
         self,
         request: "Request",
@@ -1219,6 +1247,7 @@ class LookupKeyClient:
         hash_frames = self.encoder.encode(hash_strs)
         kv_group_frames = self.encoder.encode(kv_cache_group_ids)
         all_frames = [
+            RPC_OP_LOOKUP,
             token_len.to_bytes(4, byteorder="big"),
             *kv_group_frames,
             hbm_hit_tokens.to_bytes(4, byteorder="big"),
@@ -1228,6 +1257,31 @@ class LookupKeyClient:
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")
         return result
+
+    def remove(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        kv_cache_group_ids: list[int] | None = None,
+        lazy: bool = False,
+        hbm_hit_tokens: int = 0,
+    ) -> None:
+        kv_cache_group_ids = kv_cache_group_ids or [0]
+        hash_strs = [h.hex() for h in block_hashes]
+        hash_frames = self.encoder.encode(hash_strs)
+        kv_group_frames = self.encoder.encode(kv_cache_group_ids)
+        token_len_bytes = token_len.to_bytes(4, byteorder="big")
+        lazy_byte = int(lazy).to_bytes(4, byteorder="big")
+        all_frames = [
+            RPC_OP_REMOVE,
+            token_len_bytes,
+            lazy_byte,
+            *kv_group_frames,
+            hbm_hit_tokens.to_bytes(4, byteorder="big"),
+            *hash_frames,
+        ]
+        self.socket.send_multipart(all_frames, copy=False)
+        self.socket.recv()
 
     def close(self):
         self.socket.close(linger=0)

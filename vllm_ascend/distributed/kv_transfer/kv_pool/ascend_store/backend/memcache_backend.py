@@ -38,6 +38,11 @@ class MmcDirect(Enum):
     COPY_H2G = 3
 
 
+# Lazy remove flag from memcache_hybrid (mmc_def.h: MMC_REMOVE_FLAG_LAZY = 1U << 0).
+# flags=0: immediate removal; flags=1: move key to LRU tail for natural eviction.
+_MMC_REMOVE_FLAG_LAZY = 1
+
+
 class MemcacheBackend(Backend):
     def __init__(
         self,
@@ -236,3 +241,8 @@ class MemcacheBackend(Backend):
             logger.debug("Failed to put key details. keys=%s", key)
             if self._lazy_init:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
+
+    def remove(self, keys: list[str], lazy: bool = False) -> list[int]:
+        assert self.store is not None
+        flags = _MMC_REMOVE_FLAG_LAZY if lazy else 0
+        return self.store.remove_batch(keys, flags)

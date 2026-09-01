@@ -670,6 +670,18 @@ class TestMemcacheBackendMethods(unittest.TestCase):
         self.assertIn("RuntimeError", error_log)
         self.assertIn("backend fail", error_log)
 
+    def test_remove_direct(self):
+        b = self._make_backend()
+        b.store.remove_batch.return_value = [0, 0, 0]
+        self.assertEqual(b.remove(["k1", "k2", "k3"], lazy=False), [0, 0, 0])
+        b.store.remove_batch.assert_called_once_with(["k1", "k2", "k3"], 0)
+ 
+    def test_remove_lazy(self):
+        b = self._make_backend()
+        b.store.remove_batch.return_value = [0, 0]
+        self.assertEqual(b.remove(["k1", "k2"], lazy=True), [0, 0])
+        b.store.remove_batch.assert_called_once_with(["k1", "k2"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
