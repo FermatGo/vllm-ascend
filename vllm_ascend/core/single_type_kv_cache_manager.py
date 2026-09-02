@@ -187,7 +187,7 @@ class CompressAttentionManager(FullAttentionManager):
         retention_interval: int | None = None,
         *,
         alignment_tokens: int | None = None,
-    ) -> None:
+    ) -> tuple[list[KVCacheBlock], int]:
         """
         Cache the blocks for the request.
 
@@ -215,6 +215,11 @@ class CompressAttentionManager(FullAttentionManager):
             kv_cache_group_id=self.kv_cache_group_id,
         )
         self.num_cached_block[request.request_id] = num_full_blocks
+
+        newly_cached_blocks = self.req_to_blocks[request.request_id][
+            num_cached_blocks:num_full_blocks
+        ]
+        return newly_cached_blocks, num_cached_blocks
 
     @classmethod
     def find_longest_cache_hit(
