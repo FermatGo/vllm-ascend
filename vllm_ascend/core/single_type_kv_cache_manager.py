@@ -204,7 +204,7 @@ class CompressAttentionManager(FullAttentionManager):
         num_full_blocks = num_tokens // (self.block_size * self.compress_ratio)
 
         if num_cached_blocks >= num_full_blocks:
-            return
+            return [], num_cached_blocks
 
         self.block_pool.cache_full_blocks(
             request=request,
