@@ -17,7 +17,6 @@ from vllm.v1.core.agent_hint_manager import (
     AgentHintManager,
     AgentHintManagerContext,
 )
-from vllm.v1.engine import AgentHintResponse
 
 from vllm_ascend.core.agent_hint.params import convert_agent_hint_dict
 from vllm_ascend.core.agent_hint.session_aware_manager import (
@@ -56,7 +55,7 @@ class AscendAgentHintManager(AgentHintManager):
         hint = convert_agent_hint_dict(request.agent_hint)
         return bool(hint and hint.context_management and hint.context_management.manage_request)
 
-    def register_kvc_management_request(self, request: Request) -> AgentHintResponse | None:
+    def register_kvc_management_request(self, request: Request) -> dict | None:
         hint = convert_agent_hint_dict(request.agent_hint)
         if hint is None or hint.context_management is None:
             return None
@@ -65,10 +64,10 @@ class AscendAgentHintManager(AgentHintManager):
             hint.session_id,
             hint.context_management,
         )
-        return AgentHintResponse(
-            session_id=hint.session_id,
-            edit_results=edit_results,
-        )
+        return {
+            "session_id": hint.session_id,
+            "edit_results": edit_results,
+        }
 
     def on_request_added(self, request: Request) -> None:
         hint = convert_agent_hint_dict(request.agent_hint)
