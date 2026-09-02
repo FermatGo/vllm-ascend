@@ -4,10 +4,56 @@
 """Ascend Agent Hint free-block eviction policy."""
 
 import time
+from dataclasses import dataclass
 
 from vllm.logger import logger
-from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    AgentHintBlockField,
+    FreeKVCacheBlockQueue,
+    KVCacheBlock,
+)
 
+
+@dataclass(slots=True)
+class AscendAgentHintBlockField(AgentHintBlockField):
+    _session_ref_cnt: int = 0
+    _ttl_expire_at: float = 0.0
+    _is_offload_block: bool = False
+
+    @property
+    def num_session_refs(self) -> int:
+        return self._session_ref_cnt
+
+    @property
+    def ttl_expire_at(self) -> float:
+        return self._ttl_expire_at
+
+    @property
+    def is_ephemeral(self) -> bool:
+        return self._ttl_expire_at > 0 and time.monotonic() < self._ttl_expire_at
+
+    @property
+    def is_offload_block(self) -> bool:
+        return self._is_offload_block
+
+    def set_session_state(
+        self,
+        *,
+        session_ref_cnt: int | None = None,
+        ttl_expire_at: float | None = None,
+        is_offload_block: bool | None = None,
+    ) -> None:
+        if session_ref_cnt is not None:
+            self._session_ref_cnt = session_ref_cnt
+        if ttl_expire_at is not None:
+            self._ttl_expire_at = ttl_expire_at
+        if is_offload_block is not None:
+            self._is_offload_block = is_offload_block
+
+    def reset_session_state(self) -> None:
+        self._session_ref_cnt = 0
+        self._ttl_expire_at = 0.0
+        self._is_offload_block = False
 
 
 class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
@@ -55,17 +101,11 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
             while curr_block is not self.fake_free_list_tail:
                 if curr_block is None or curr_block.next_free_block is None:
-                    raise RuntimeError(
-                        "Invalid block found in popleft() "
-                        "which doesn't have a valid next_free_block"
-                    )
+                    raise RuntimeError("Invalid block found in popleft() which doesn't have a valid next_free_block")
 
                 next_block = curr_block.next_free_block
 
-                if (
-                    curr_block.ttl_expire_at > 0
-                    and time.monotonic() >= curr_block.ttl_expire_at
-                ):
+                if curr_block.ttl_expire_at > 0 and time.monotonic() >= curr_block.ttl_expire_at:
                     curr_block.set_session_state(ttl_expire_at=0.0)
                     if curr_block.num_session_refs > 0:
                         self.promote_to_zone_b(curr_block)
@@ -86,8 +126,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             or self.fake_free_list_head.next_free_block is None
         ):
             assert self.num_free_blocks == 0, (
-                f"num_free_blocks ({self.num_free_blocks}) is out of sync "
-                "with the free list."
+                f"num_free_blocks ({self.num_free_blocks}) is out of sync with the free list."
             )
             raise ValueError("No free blocks available")
 
@@ -98,10 +137,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         if first_block.next_free_block is None:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
-            raise RuntimeError(
-                "Invalid block found in popleft() "
-                "which doesn't have a valid next_free_block"
-            )
+            raise RuntimeError("Invalid block found in popleft() which doesn't have a valid next_free_block")
 
         if first_block is self.zone1_end:
             self.zone1_end = None
@@ -186,17 +222,12 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         next_block = block.next_free_block
 
         if block is self.zone1_end:
-            self.zone1_end = (
-                prev_block if prev_block is not self.fake_free_list_head else None
-            )
+            self.zone1_end = prev_block if prev_block is not self.fake_free_list_head else None
 
         if block is self.zone2_end:
             self.zone2_end = (
                 prev_block
-                if (
-                    prev_block is not self.fake_free_list_head
-                    and prev_block is not self.zone1_end
-                )
+                if (prev_block is not self.fake_free_list_head and prev_block is not self.zone1_end)
                 else None
             )
 
@@ -223,9 +254,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             deadline-protected blocks, ordered by _ttl_expire_at ascending.
         """
         if self.fake_free_list_tail.prev_free_block is None:
-            raise RuntimeError(
-                "prev_free_block of fake_free_list_tail should always exist"
-            )
+            raise RuntimeError("prev_free_block of fake_free_list_tail should always exist")
 
         if block.is_ephemeral:
             logger.debug(
@@ -302,15 +331,11 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             return
 
         last_block = self.fake_free_list_tail.prev_free_block
-        assert last_block is not None, (
-            "prev_free_block of fake_free_list_tail should always exist"
-        )
+        assert last_block is not None, "prev_free_block of fake_free_list_tail should always exist"
 
         only_zone_a_or_empty = self.num_free_blocks == 0 or self.zone1_end is last_block
 
-        blocks_only_zone_a = all(
-            not block.is_ephemeral and block.num_session_refs == 0 for block in blocks
-        )
+        blocks_only_zone_a = all(not block.is_ephemeral and block.num_session_refs == 0 for block in blocks)
 
         if not only_zone_a_or_empty or not blocks_only_zone_a:
             for block in blocks:
@@ -346,10 +371,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         if block is self.zone2_end:
             self.zone2_end = (
                 prev_block
-                if (
-                    prev_block is not self.fake_free_list_head
-                    and prev_block is not self.zone1_end
-                )
+                if (prev_block is not self.fake_free_list_head and prev_block is not self.zone1_end)
                 else None
             )
 
@@ -381,19 +403,12 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         # block 原来是 A 区最后一个节点。
         if block is self.zone1_end:
-            self.zone1_end = (
-                old_prev if old_prev is not self.fake_free_list_head else None
-            )
+            self.zone1_end = old_prev if old_prev is not self.fake_free_list_head else None
 
         # block 原来是 B 区最后一个节点。
         if block is self.zone2_end:
             self.zone2_end = (
-                old_prev
-                if (
-                    old_prev is not self.fake_free_list_head
-                    and old_prev is not self.zone1_end
-                )
-                else None
+                old_prev if (old_prev is not self.fake_free_list_head and old_prev is not self.zone1_end) else None
             )
 
         old_prev.next_free_block = old_next
@@ -416,9 +431,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         next_block = prev_block.next_free_block
         if next_block is None:
-            raise RuntimeError(
-                f"Invalid zone B insertion position for block {block.block_id}"
-            )
+            raise RuntimeError(f"Invalid zone B insertion position for block {block.block_id}")
 
         prev_block.next_free_block = block
         block.prev_free_block = prev_block
@@ -445,19 +458,12 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         # block 原来是 A 区最后一个节点。
         if block is self.zone1_end:
-            self.zone1_end = (
-                old_prev if old_prev is not self.fake_free_list_head else None
-            )
+            self.zone1_end = old_prev if old_prev is not self.fake_free_list_head else None
 
         # block 原来是 B 区最后一个节点。
         if block is self.zone2_end:
             self.zone2_end = (
-                old_prev
-                if (
-                    old_prev is not self.fake_free_list_head
-                    and old_prev is not self.zone1_end
-                )
-                else None
+                old_prev if (old_prev is not self.fake_free_list_head and old_prev is not self.zone1_end) else None
             )
 
         old_prev.next_free_block = old_next
@@ -484,9 +490,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         next_block = prev_block.next_free_block
         if next_block is None:
-            raise RuntimeError(
-                f"Invalid zone C insertion position for block {block.block_id}"
-            )
+            raise RuntimeError(f"Invalid zone C insertion position for block {block.block_id}")
 
         prev_block.next_free_block = block
         block.prev_free_block = prev_block
