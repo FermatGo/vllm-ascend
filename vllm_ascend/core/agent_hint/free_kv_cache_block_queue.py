@@ -8,14 +8,13 @@ from dataclasses import dataclass
 
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import (
-    AgentHintBlockField,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
 )
 
 
 @dataclass(slots=True)
-class AscendAgentHintBlockField(AgentHintBlockField):
+class AgentHintKVCacheBlock(KVCacheBlock):
     _session_ref_cnt: int = 0
     _ttl_expire_at: float = 0.0
     _is_offload_block: bool = False

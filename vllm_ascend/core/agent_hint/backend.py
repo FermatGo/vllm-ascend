@@ -7,15 +7,11 @@ from vllm.v1.core.agent_hint_manager import (
     AgentHintManager,
     AgentHintManagerContext,
 )
-from vllm.v1.core.kv_cache_utils import (
-    AgentHintBlockField,
-    FreeKVCacheBlockQueue,
-    KVCacheBlock,
-)
+from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
 from vllm_ascend.core.agent_hint.free_kv_cache_block_queue import (
     AgentHintFreeKVCacheBlockQueue,
-    AscendAgentHintBlockField,
+    AgentHintKVCacheBlock,
 )
 from vllm_ascend.core.agent_hint.manager import AscendAgentHintManager
 
@@ -34,8 +30,8 @@ class AscendAgentHintBackend(AgentHintBackend):
             return AgentHintManager()
         return AscendAgentHintManager(context)
 
-    def create_kv_cache_block_field(self) -> AgentHintBlockField:
-        return AscendAgentHintBlockField()
+    def create_kv_cache_block(self, block_id: int) -> KVCacheBlock:
+        return AgentHintKVCacheBlock(block_id)
 
     def create_free_kv_cache_block_queue(
         self,
