@@ -207,7 +207,7 @@ class SessionAwareManager:
 
                 # allocate_slots理论上只传 newly-cached blocks，保留检查用于防御异常情况。
                 if block.block_hash is None:
-                    logger.warning("Newly cached block %s has no block hash", block_id)
+                    logger.debug("Newly cached block %s has no block hash", block_id)
                     continue
 
                 # SessionBlockRecord所需参数计算
@@ -1052,7 +1052,7 @@ class TTLManager:
         如果不存在：创建新的 TTLBlockEntry 并插入 timer wheel。
         """
         protected_hash_len = 0
-        if protected_block_hashes is not None:
+        if protected_block_hashes is not None and len(protected_block_hashes) > 0:
             block_infos.append((0, protected_block_hashes))
             protected_hash_len = len(protected_block_hashes)
 
