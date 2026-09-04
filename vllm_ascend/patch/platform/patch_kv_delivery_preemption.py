@@ -78,6 +78,7 @@ class KVDeliveryScheduler(Scheduler):
             log_stats,
         )
         self.requires_kv_delivery = bool(self.connector is not None and self.connector.requires_kv_delivery)
+        self.stage_record = {"mixed": 0, "prefill_only":0, "decode_only":0}
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -126,6 +127,8 @@ class KVDeliveryScheduler(Scheduler):
         # First, schedule the RUNNING requests.
         req_index = 0
         self.agent_hint_manager.on_step(self.get_num_unfinished_requests())
+        decode_count = 0
+        prefill_count = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             self.agent_hint_manager.on_request_scheduled(request)
@@ -271,6 +274,7 @@ class KVDeliveryScheduler(Scheduler):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            decode_count += 1
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -467,6 +471,8 @@ class KVDeliveryScheduler(Scheduler):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                logger.info(
+                    f"req id={request.request_id} num_new_local_computed_tokens={num_new_local_computed_tokens} num_external_computed_tokens={num_external_computed_tokens} total prompt token={request.num_tokens}")
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -634,6 +640,7 @@ class KVDeliveryScheduler(Scheduler):
                     continue
 
                 self.running.append(request)
+                prefill_count += 1
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
@@ -748,6 +755,16 @@ class KVDeliveryScheduler(Scheduler):
         scheduled_encoder_input_stats = None
         if self.log_stats and self.observability_config.enable_logging_iteration_details:
             scheduled_encoder_input_stats = self._make_scheduled_encoder_input_stats(scheduled_encoder_inputs)
+        if prefill_count > 0 and decode_count > 0:
+            logger.info(f"schedule mixed batch result: prefill count {prefill_count} decode count {decode_count} total {prefill_count+decode_count}")
+        if prefill_count == 0:
+            self.stage_record["decode_only"] += 1
+        elif decode_count == 0:
+            self.stage_record["prefill_only"] += 1
+        else:
+            self.stage_record["mixed"] += 1
+        if sum(self.stage_record.values()) % 100 == 0:
+            logger.info(f"batch stage record is {self.stage_record}")
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
