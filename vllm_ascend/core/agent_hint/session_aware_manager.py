@@ -1055,6 +1055,8 @@ class TTLManager:
         if protected_block_hashes is not None and len(protected_block_hashes) > 0:
             block_infos.append((0, protected_block_hashes))
             protected_hash_len = len(protected_block_hashes)
+        else:
+            return
 
         logger.debug(f"TTL Manager: working to register {len(block_infos)} blocks into timer wheel")
         for block_info in block_infos:
