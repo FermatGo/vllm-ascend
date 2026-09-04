@@ -60,6 +60,9 @@ class SessionKeyTracker:
         session_id: str,
         block_hashes: list[BlockHash],
     ) -> None:
+        if block_hashes is None or len(block_hashes) == 0:
+            logger.warning(f"SessionKeyTracker.add_hashes: invalid block_hashes: {block_hashes}")
+            return
         with self._lock:
             self._session_hashes[session_id] = block_hashes
             logger.debug(f"SessionKeyTracker.add_hashes: session_id: {session_id}, block_hashes saved: {block_hashes}")
