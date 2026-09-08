@@ -20,7 +20,7 @@ from vllm_ascend.core.agent_hint.params import (
     CacheControlParams,
     ContextManagementEditsParams,
     ContextManagementParams,
-    convert_agent_hint_dict,
+    get_agent_hint_params,
 )
 from vllm.v1.request import Request
 
@@ -119,7 +119,8 @@ class SessionAwareManager:
         self, request: Request, blocks: KVCacheBlocks, cached_blocks_len_before: tuple[int, ...] | None = None
     ) -> None:
         # 解析引擎层透传的 opaque dict 为 ascend 强类型视图
-        hint = convert_agent_hint_dict(request.agent_hint)
+        # 结果已缓存到 request._agent_hint_params，避免每个 block 都重新解析。
+        hint = get_agent_hint_params(request)
         # 如果 request 没有 session_id，则不进行 session 相关的处理
         # 但是清理所有 block 的 session 引用和 TTL，避免残留
         if not hint or hint.session_id is None:
@@ -154,7 +155,7 @@ class SessionAwareManager:
         )
 
     def on_block_cache_hit_for_request(self, request: Request, blocks: KVCacheBlocks) -> None:
-        hint = convert_agent_hint_dict(request.agent_hint)
+        hint = get_agent_hint_params(request)
         if hint is None or hint.session_id is None:
             return
 

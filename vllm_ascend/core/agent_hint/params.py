@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from typing import Any, Literal
 from collections.abc import Mapping
@@ -53,6 +54,10 @@ def _to_mapping(obj: Any) -> Mapping:
     return dict(obj)
 
 
+# Sentinel used to distinguish "not yet cached" from "cached None".
+_AGENT_HINT_NOT_COMPUTED: Any = object()
+
+
 def convert_agent_hint_dict(agent_hint: Any) -> AgentHintParams | None:
     """把 ``EngineCoreRequest`` / ``Request`` 透传的 opaque ``agent_hint``
     (dict 或 pydantic 模型) 解析为 ascend 内部使用的强类型
@@ -60,6 +65,7 @@ def convert_agent_hint_dict(agent_hint: Any) -> AgentHintParams | None:
 
     ``agent_hint`` 为 ``None`` 时返回 ``None``。
     """
+    t0 = int(time.time() * 1_000_000)
     if agent_hint is None:
         return None
 
@@ -109,6 +115,10 @@ def convert_agent_hint_dict(agent_hint: Any) -> AgentHintParams | None:
             edits=edits,
         )
 
+    t1 = int(time.time() * 1_000_000)
+
+    print(f'===== convert_agent_hint_dict: {(t1 - t0)} us')
+
     return AgentHintParams(
         session_id=ah.get("session_id"),
         parent_session_id=ah.get("parent_session_id"),
@@ -117,3 +127,27 @@ def convert_agent_hint_dict(agent_hint: Any) -> AgentHintParams | None:
         latency_control=ah.get("latency_control"),
         priority_control=ah.get("priority_control"),
     )
+
+
+def get_agent_hint_params(request: Any) -> AgentHintParams | None:
+    """返回 request 对应的 ``AgentHintParams``，结果缓存到 request 上。
+
+    同一个 request 在生命周期内可能被多次查询（如 on_blocks_allocated、
+    on_block_cache_hit、register_kvc_management_request 等）。每次都调用
+    ``convert_agent_hint_dict`` 会有重复开销，因此将首次解析的结果存到
+    ``request._agent_hint_params`` 上，后续直接复用。
+
+    ``agent_hint`` 为 ``None`` 时缓存并返回 ``None``。
+    """
+    cached = getattr(request, "_agent_hint_params", _AGENT_HINT_NOT_COMPUTED)
+    if cached is not _AGENT_HINT_NOT_COMPUTED:
+        return cached  # type: ignore[return-value]
+
+    params = convert_agent_hint_dict(getattr(request, "agent_hint", None))
+    try:
+        request._agent_hint_params = params  # type: ignore[attr-defined]
+    except Exception:
+        # request 对象可能禁止动态设置属性（如带 __slots__ 的类），此时
+        # 退化为每次重新解析。
+        return params
+    return params
