@@ -9,7 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.logger import logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm_ascend.core.agent_hint.params import convert_agent_hint_dict
+from vllm_ascend.core.agent_hint.params import get_agent_hint_params
 from vllm.v1.request import Request
 
 from vllm_ascend.core.agent_hint.session_aware_manager import SessionAwareManager
@@ -232,9 +232,10 @@ class SessionAwarePoolingManager(SessionEventListener):
         # block_ids = self.sam.get_session_block_ids(prefetch_req.session_id)
         block_ids = prefetch_req.dest_block_ids
         if not block_ids:
+            hint = get_agent_hint_params(prefetch_req)
             logger.warning(
                 "Session %s has no allocated blocks, skipping prefetch",
-                convert_agent_hint_dict(prefetch_req.agent_hint).session_id if prefetch_req.agent_hint else None,
+                hint.session_id if hint else None,
             )
             return
 
@@ -329,8 +330,9 @@ class SessionAwarePoolingManager(SessionEventListener):
         # 处理上一轮次prefetch
         for i in range(0, len(self.prefetch_running_queue)):
             free_prefetch_running_req = self.prefetch_running_queue[i]
+            free_hint = get_agent_hint_params(free_prefetch_running_req)
             logger.info(
-                f"free prefetch request {free_prefetch_running_req.request_id} and session id {convert_agent_hint_dict(free_prefetch_running_req.agent_hint).session_id if free_prefetch_running_req.agent_hint else None}"
+                f"free prefetch request {free_prefetch_running_req.request_id} and session id {free_hint.session_id if free_hint else None}"
             )
             self.sam.kv_cache_manager.free(free_prefetch_running_req)
         self.prefetch_running_queue = []
