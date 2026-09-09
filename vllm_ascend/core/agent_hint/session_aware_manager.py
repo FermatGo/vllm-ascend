@@ -3,6 +3,7 @@
 # ruff: noqa: E501, G004
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -27,6 +28,11 @@ from vllm_ascend.core.agent_hint.params import (
     get_agent_hint_params,
 )
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
+
+# Env var switch: when enabled, offload registers a 1h TTL protection on
+# the affected blocks. Disabled by default (no TTL registered on offload).
+_ENABLE_OFFLOAD_TTL_PROTECT = os.getenv("VLLM_ASCEND_OFFLOAD_TTL_PROTECT",
+                                          "false").lower() in ("true", "1")
 
 
 @dataclass
@@ -550,12 +556,13 @@ class SessionAwareManager:
             affected_block_hashes.extend(self._session_block_hash.get(session_id, [])[block_start_e:block_end_e])
         res = len(affected_block_hashes)
 
-        # self._ttl_manager.register(
-        #     block_infos=[],
-        #     session_id=session_id,
-        #     expire_at=time.monotonic() + 3600,
-        #     protected_block_hashes=affected_block_hashes,
-        # )
+        if _ENABLE_OFFLOAD_TTL_PROTECT:
+            self._ttl_manager.register(
+                block_infos=[],
+                session_id=session_id,
+                expire_at=time.monotonic() + 3600,
+                protected_block_hashes=affected_block_hashes,
+            )
 
         return res
 
@@ -1161,21 +1168,24 @@ def example_expired_callback(block_id: int, session_id: str) -> None:
 
 class SessionController:
     # TODO: 考虑预取请求有content / session已被清理，重新计算hash
-    """Context management edits 执行器。
+    """Executor for ``context_management.edits``.
 
-    处理请求携带的 context_management.edits，根据
-    manage_request 标志决定是立即执行还是在请求完成后执行。
-    通过注册回调执行实际的 block 操作，不感知具体的
-    offload/prefetch/evict 实现。
+    Processes the ``context_management.edits`` carried by a request,
+    executing them immediately or deferring them until the request
+    finishes based on the ``manage_request`` flag. It performs the actual
+    block operations through registered callbacks and is agnostic to the
+    concrete offload/prefetch/evict implementations.
 
-    Required callbacks
-    ------------------
-    execute_offload  (block_ids: list[int], session_id: str) -> None
-        执行 offload 操作。
-    execute_prefetch (block_ids: list[int], session_id: str) -> None
-        执行 prefetch 操作。
-    execute_evict   (block_ids: list[int], session_id: str) -> None
-        执行 evict 操作。
+    Registry callbacks (perform the actual HBM operations)
+    ------------------------------------------------------
+    ``execute_offload``   (block_ids: list[int], session_id: str) -> None
+    ``execute_prefetch``  (block_ids: list[int], session_id: str) -> None
+    ``execute_evict``     (block_ids: list[int], session_id: str) -> None
+
+    Query callbacks (stored as attributes, invoked directly)
+    --------------------------------------------------------
+    ``get_block_hashes_by_session`` (session_id, start, end) -> list[list[BlockHash]]
+    ``get_global_block_id_by_session`` (session_id, start, end) -> list[list[int]]
     """
 
     def __init__(
