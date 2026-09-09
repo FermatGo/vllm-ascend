@@ -44,6 +44,28 @@ class PrefetchRequest:
     priority: int = 0  # 优先级（0=最高，由 manage_request 触发）
 
 
+class PoolingCacheController:
+    """控制远端offload和evict"""
+    def __init__(
+        self,
+        connector: KVConnectorBase_V1,
+        block_size: int = 0,
+    ):
+        self.connector = connector
+        self.block_size = block_size
+
+    def remove(
+        self,
+        block_hashes: list[BlockHash],
+        lazy: bool = False,
+    ) -> None:
+        if not block_hashes:
+            return
+        token_len = self.block_size * len(block_hashes)
+        logger.warning(f"SPM.PoolingCacheController: token_len: {token_len}, block_hashes-len:{len(block_hashes)}")
+        self.connector.remove(token_len, block_hashes, lazy)
+
+
 class SessionKeyTracker:
     """跟踪每个 session 写入远端存储的 PoolKey"""
 
@@ -163,6 +185,9 @@ class SessionAwarePoolingManager(SessionEventListener):
         # SessionKeyTracker — PoolKey 跟踪
         self.key_tracker = SessionKeyTracker()
 
+        # PoolingCacheController 模块
+        self.pooling_cache_controller: PoolingCacheController | None = None
+
         # Keep-Alive 线程
         self.keep_alive_thread: KVCacheKeepAliveThread | None = None
 
@@ -175,7 +200,7 @@ class SessionAwarePoolingManager(SessionEventListener):
         self.block_size = 0
 
     def start(self) -> None:
-        """启动 Keep-Alive 线程"""
+        """初始化PoolingCacheController模块, 启动 Keep-Alive 线程"""
         if self.config.enable_keep_alive and self.connector is not None:
             # TODO: 修改线程入口
             self.keep_alive_thread = KVCacheKeepAliveThread(
@@ -186,6 +211,11 @@ class SessionAwarePoolingManager(SessionEventListener):
             )
             self.keep_alive_thread.start()
             logger.info("Keep-alive thread start.")
+            # 初始化PoolingCacheController
+            self.pooling_cache_controller = PoolingCacheController(
+                connector=self.connector,
+                block_size=self.block_size,
+            )
 
     def stop(self) -> None:
         """停止 Keep-Alive 线程"""
@@ -251,9 +281,6 @@ class SessionAwarePoolingManager(SessionEventListener):
     def on_context_management_prefetch(
         self,
         session_id: str | None = None,
-        logical_block_start: int | None = None,
-        logical_block_end: int = None,
-        block_ids: list[int] | None = None,
         block_hashes: list[BlockHash] = None,
     ) -> bool:
         """prefetch 操作时创建预取请求"""
@@ -296,10 +323,21 @@ class SessionAwarePoolingManager(SessionEventListener):
 
     def on_context_management_evict(
         self,
-        session_id: str | None = None,
         block_hashes: list[BlockHash] = None,
     ) -> int:
-        return self.on_session_blocks_removed(session_id, block_hashes)
+        self.pooling_cache_controller.remove(
+            block_hashes,
+            lazy=False
+        )
+
+    def on_context_management_offload(
+        self,
+        block_hashes: list[BlockHash] = None,
+    ) -> None:
+        self.pooling_cache_controller.remove(
+            block_hashes,
+            lazy=True
+        )
 
     def process_prefetch_req(self, num_unfinished_requests: int) -> list[tuple[str, list[BlockHash]]]:
         """处理预取请求，返回 [(session_id, prefetched_block_hashes), ...] 供 SAM 更新 SSM。"""
