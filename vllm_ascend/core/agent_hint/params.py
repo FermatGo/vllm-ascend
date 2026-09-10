@@ -65,7 +65,6 @@ def convert_agent_hint_dict(agent_hint: Any) -> AgentHintParams | None:
 
     ``agent_hint`` 为 ``None`` 时返回 ``None``。
     """
-    t0 = int(time.time() * 1_000_000)
     if agent_hint is None:
         return None
 
@@ -114,10 +113,6 @@ def convert_agent_hint_dict(agent_hint: Any) -> AgentHintParams | None:
             manage_request=cm.get("manage_request", False),
             edits=edits,
         )
-
-    t1 = int(time.time() * 1_000_000)
-
-    print(f'===== convert_agent_hint_dict: {(t1 - t0)} us')
 
     return AgentHintParams(
         session_id=ah.get("session_id"),
