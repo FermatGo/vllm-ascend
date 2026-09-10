@@ -16,14 +16,14 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     get_block_hash,
 )
+from vllm.v1.request import Request
+
 from vllm_ascend.core.agent_hint.params import (
     CacheControlParams,
     ContextManagementEditsParams,
     ContextManagementParams,
     get_agent_hint_params,
 )
-from vllm.v1.request import Request
-
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
 
 
@@ -1150,60 +1150,27 @@ class SessionController:
         执行 evict 操作。
     """
 
-    _REQUIRED_CALLBACKS: list[str] = [
-        "execute_offload",
-        "execute_prefetch",
-        "execute_evict",
-        "get_global_block_id_by_session",
-        "get_block_hashes_by_session",
-    ]
-
     def __init__(
         self,
-        callbacks: dict[str, Callable[..., Any]] | None = None,
-        **kw_callbacks: Callable[..., Any],
+        *,
+        execute_offload: Callable[..., int],
+        execute_prefetch: Callable[..., int],
+        execute_evict: Callable[..., int],
+        get_global_block_id_by_session: Callable[[str, int, int], tuple[list[int], ...]],
+        get_block_hashes_by_session: Callable[[str, int, int], list[BlockHash]],
     ):
-        """
-        Parameters
-        ----------
-        callbacks : dict[str, Callable], optional
-            A mapping of {name: fn} to register in bulk.
-        **kw_callbacks
-            Same as *callbacks* but passed as keyword arguments.
-        """
-        self._registry: dict[str, Callable[..., Any]] = {}
-
-        if callbacks:
-            self._registry.update(callbacks)
-        if kw_callbacks:
-            self._registry.update(kw_callbacks)
-
-        missing = [name for name in self._REQUIRED_CALLBACKS if name not in self._registry]
-        if missing:
-            raise ValueError(
-                f"Missing required callbacks: {missing}. Provide them via `callbacks` dict or keyword arguments."
-            )
+        self._execute_callbacks: dict[str, Callable[..., int]] = {
+            "offload": execute_offload,
+            "prefetch": execute_prefetch,
+            "evict": execute_evict,
+        }
+        self._get_global_block_id_by_session = get_global_block_id_by_session
+        self._get_block_hashes_by_session = get_block_hashes_by_session
 
         # request_id → [(edit, session_id), ...]
         self._pending_edits: dict[str, list[tuple[ContextManagementEditsParams, str]]] = {}
 
-        logger.info("SessionController initialized with callbacks: %s", list(self._registry))
-
-    # ------------------------------------------------------------------
-    #  Registry management
-    # ------------------------------------------------------------------
-
-    def register(self, name: str, fn: Callable[..., Any]) -> None:
-        """Register (or overwrite) a callback by *name*."""
-        self._registry[name] = fn
-        logger.debug("Registered callback: %s", name)
-
-    def unregister(self, name: str) -> None:
-        """Remove a callback.  Required callbacks cannot be removed."""
-        if name in self._REQUIRED_CALLBACKS:
-            raise ValueError(f"Cannot unregister required callback '{name}'.")
-        self._registry.pop(name, None)
-        logger.debug("Unregistered callback: %s", name)
+        logger.info("SessionController initialized.")
 
     # ------------------------------------------------------------------
     #  Public API
@@ -1320,8 +1287,7 @@ class SessionController:
             f"(block_start={edit.block_start}, block_end={edit.block_end})."
         )
 
-        callback_name = f"execute_{edit.type}"
-        fn = self._registry.get(callback_name)
+        fn = self._execute_callbacks.get(edit.type)
         if fn is None:
             logger.warning("No callback registered for edit type: %s, skipping.", edit.type)
             return EditResponse(
@@ -1334,30 +1300,26 @@ class SessionController:
         is_session_op = edit.target == "session"
 
         # TODO: 获取当前session 基础hash总长度
-        total_block_length = len(self._registry.get("get_block_hashes_by_session")(session_id, 0, -1))
+        total_block_length = len(self._get_block_hashes_by_session(session_id, 0, -1))
         logger.info(f"Process session {session_id} with block hash lengh {total_block_length}")
         op_result, fail_reason = self.process_edit_index(edit, total_block_length, session_id)
 
         if op_result:
-            get_block_info_fn = None
             if edit.type == "prefetch":
-                callback_name = "get_block_hashes_by_session"
-                get_block_info_fn = self._registry.get(callback_name)
+                get_block_info_fn = self._get_block_hashes_by_session
             else:
-                callback_name = "get_global_block_id_by_session"
-                get_block_info_fn = self._registry.get(callback_name)
-            if get_block_info_fn is not None:
-                process_session_block_info = get_block_info_fn(session_id, edit.block_start, edit.block_end)
-                process_num = 0
-                for info in process_session_block_info:
-                    process_num += len(info)
-                logger.info(f"session {session_id} session hash or block id count {process_num}")
-                if edit.type == "prefetch":
-                    actual_process_blocks = fn(session_id, process_session_block_info, is_session_op)
-                else:
-                    actual_process_blocks = fn(
-                        session_id, edit.block_start, edit.block_end, process_session_block_info, is_session_op
-                    )
+                get_block_info_fn = self._get_global_block_id_by_session
+            process_session_block_info = get_block_info_fn(session_id, edit.block_start, edit.block_end)
+            process_num = 0
+            for info in process_session_block_info:
+                process_num += len(info)
+            logger.info(f"session {session_id} session hash or block id count {process_num}")
+            if edit.type == "prefetch":
+                actual_process_blocks = fn(session_id, process_session_block_info, is_session_op)
+            else:
+                actual_process_blocks = fn(
+                    session_id, edit.block_start, edit.block_end, process_session_block_info, is_session_op
+                )
 
         return EditResponse(
             session_id=session_id,

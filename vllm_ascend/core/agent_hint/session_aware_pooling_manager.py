@@ -8,11 +8,11 @@ from typing import Callable
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.logger import logger
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm_ascend.core.agent_hint.params import get_agent_hint_params
 from vllm.v1.request import Request
 
-from vllm_ascend.core.agent_hint.session_aware_manager import SessionAwareManager
+from vllm_ascend.core.agent_hint.params import get_agent_hint_params
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
 
 
@@ -150,12 +150,12 @@ class SessionAwarePoolingManager(SessionEventListener):
     # TODO：检查ttl接口是否正确
     def __init__(
         self,
-        sam: SessionAwareManager,
+        kv_cache_manager: KVCacheManager,
         add_request: Callable[[Request], None],
         connector: KVConnectorBase_V1 | None = None,
         config: SPMConfig | None = None,
     ):
-        self.sam = sam
+        self.kv_cache_manager = kv_cache_manager
         self._add_request = add_request
         self.connector = connector
         self.config = config or SPMConfig()
@@ -171,9 +171,6 @@ class SessionAwarePoolingManager(SessionEventListener):
 
         # 进行预取中的队列
         self.prefetch_running_queue: list[Request] = []
-
-        # 注册为 SAM 事件监听器
-        sam.add_event_listener(self)
 
         self.block_size = 0
 
@@ -225,14 +222,6 @@ class SessionAwarePoolingManager(SessionEventListener):
         return res
 
     def _submit_prefetch_to_scheduler(self, prefetch_req, matched_tokens):
-        # 从 SAM 获取 session 已有的 block 和对应的 Request 对象
-        # request = self.sam.get_request_by_session(prefetch_req.session_id)
-        # if request is None:
-        #     logger.warning("Session %s has no active request, skipping prefetch", prefetch_req.session_id)
-        #     return
-
-        # 获取 session 已有的 block_ids（通过 KVCacheManager）
-        # block_ids = self.sam.get_session_block_ids(prefetch_req.session_id)
         block_ids = prefetch_req.dest_block_ids
         if not block_ids:
             hint = get_agent_hint_params(prefetch_req)
@@ -251,23 +240,6 @@ class SessionAwarePoolingManager(SessionEventListener):
         # 这需要在 block 分配时建立映射，或通过 block_pool.blocks[block_id]._block_hash 间接获取
         # 实现时需要与 KVCacheManager/AscendStoreConnector 协调
         return []
-
-    def on_session_blocks_allocated(
-        self,
-        session_id: str | None = None,
-        # block_ids: list[int] = None,
-        # pool_keys: list[str] = None,       # 远端 PoolKey 列表（来自 AscendStoreConnector）
-        block_hashes: list[BlockHash] = None,  # 对应的 block hash
-    ) -> None:
-        return
-
-    def on_session_cache_hit(
-        self,
-        session_id: str | None = None,
-        block_id: int | None = None,
-        block_hash: BlockHash | None = None,
-    ) -> None:
-        return
 
     def on_session_ttl_expired(
         self,
@@ -337,7 +309,7 @@ class SessionAwarePoolingManager(SessionEventListener):
             logger.info(
                 f"free prefetch request {free_prefetch_running_req.request_id} and session id {free_hint.session_id if free_hint else None}"
             )
-            self.sam.kv_cache_manager.free(free_prefetch_running_req)
+            self.kv_cache_manager.free(free_prefetch_running_req)
         self.prefetch_running_queue = []
 
         # 处理当前轮次prefetch请求
@@ -362,7 +334,7 @@ class SessionAwarePoolingManager(SessionEventListener):
                 )
                 # 检查当前预取请求HBM命中情况
                 local_hit_req.block_hashes = tmp_prefetch_req.block_hashes
-                local_blocks, local_computed_tokens, _ = self.sam.kv_cache_manager.get_computed_blocks(local_hit_req)
+                local_blocks, local_computed_tokens, _ = self.kv_cache_manager.get_computed_blocks(local_hit_req)
 
                 # 获取本地命中block hash
                 if local_computed_tokens > 0:
@@ -408,14 +380,14 @@ class SessionAwarePoolingManager(SessionEventListener):
                     total_hit_block_hashes = local_hit_block_hashes
                     tmp_req.block_hashes = total_hit_block_hashes
 
-                    new_blocks = self.sam.kv_cache_manager.allocate_slots(
+                    new_blocks = self.kv_cache_manager.allocate_slots(
                         tmp_req,
                         num_new_tokens=max(total_external_matched_tokens, 1),
                         num_new_computed_tokens=local_computed_tokens,
                         new_computed_blocks=local_blocks,
                     )
                     if new_blocks:
-                        tmp_prefetch_req.dest_block_ids = self.sam.kv_cache_manager.get_blocks(
+                        tmp_prefetch_req.dest_block_ids = self.kv_cache_manager.get_blocks(
                             tmp_prefetch_req.request_id
                         ).get_block_ids()
                         tmp_prefetch_req.token_len = len(total_hit_block_hashes) * hash_block_size
@@ -443,3 +415,9 @@ class SessionAwarePoolingManager(SessionEventListener):
             logger.info(
                 f"adding company req for unfinish req {num_unfinished_requests} and prefetch count {len(self.prefetch_running_queue)}"
             )
+
+
+class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
+    """Session-aware pooling manager for the Memcache backend."""
+
+    pass

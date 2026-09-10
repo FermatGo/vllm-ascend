@@ -39,10 +39,11 @@ class AscendAgentHintManager(AgentHintManager):
 
         if context.connector is not None:
             self._pooling_manager = SessionAwarePoolingManager(
-                sam=self._session_manager,
+                kv_cache_manager=context.kv_cache_manager,
                 add_request=context.add_request,
                 connector=context.connector,
             )
+            self._session_manager.add_event_listener(self._pooling_manager)
             self._pooling_manager.block_size = context.hash_block_size
             self._pooling_manager.start()
 
