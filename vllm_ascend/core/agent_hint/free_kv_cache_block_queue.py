@@ -18,6 +18,15 @@ class AgentHintKVCacheBlock(KVCacheBlock):
     _session_ref_cnt: int = 0
     _ttl_expire_at: float = 0.0
     _is_offload_block: bool = False
+    # Bucket index in zone B (-1 when the block is not in zone B).
+    # Set by FreeKVCacheBlockQueue when the block is inserted into a B-zone
+    # bucket, and reset to -1 when the block leaves zone B.
+    _zone_b_bucket: int = -1
+
+    # Index in the C-zone min-heap (-1 when the block is not in the heap).
+    # Set by FreeKVCacheBlockQueue when the block enters zone C, and reset
+    # to -1 when the block leaves zone C.  Enables O(log n) heap removal.
+    _heap_index: int = -1
 
     @property
     def num_session_refs(self) -> int:
@@ -35,12 +44,22 @@ class AgentHintKVCacheBlock(KVCacheBlock):
     def is_offload_block(self) -> bool:
         return self._is_offload_block
 
+    @property
+    def zone_b_bucket(self) -> int:
+        return self._zone_b_bucket
+
+    @property
+    def heap_index(self) -> int:
+        return self._heap_index
+
     def set_session_state(
         self,
         *,
         session_ref_cnt: int | None = None,
         ttl_expire_at: float | None = None,
         is_offload_block: bool | None = None,
+        zone_b_bucket: int | None = None,
+        heap_index: int | None = None,
     ) -> None:
         if session_ref_cnt is not None:
             self._session_ref_cnt = session_ref_cnt
@@ -48,11 +67,17 @@ class AgentHintKVCacheBlock(KVCacheBlock):
             self._ttl_expire_at = ttl_expire_at
         if is_offload_block is not None:
             self._is_offload_block = is_offload_block
+        if zone_b_bucket is not None:
+            self._zone_b_bucket = zone_b_bucket
+        if heap_index is not None:
+            self._heap_index = heap_index
 
     def reset_session_state(self) -> None:
         self._session_ref_cnt = 0
         self._ttl_expire_at = 0.0
         self._is_offload_block = False
+        self._zone_b_bucket = -1
+        self._heap_index = -1
 
 
 class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
@@ -87,35 +112,275 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         self.zone1_end: KVCacheBlock | None = blocks[-1] if blocks else None
         self.zone2_end: KVCacheBlock | None = None
 
-    def lazy_scan_zone_c(self, check_ttl: bool) -> None:
-        """Promote blocks whose TTL has expired from zone C."""
-        if check_ttl:
-            # Scan C once and promote blocks whose deadline has expired.
-            if self.zone2_end is not None:
-                curr_block = self.zone2_end.next_free_block
-            elif self.zone1_end is not None:
-                curr_block = self.zone1_end.next_free_block
+        # B zone bucketing: blocks are grouped by _session_ref_cnt into
+        # buckets.  Bucket k (0 <= k < num_b_buckets - 1) holds blocks with
+        # _session_ref_cnt == k.  The last bucket (num_b_buckets - 1) holds
+        # blocks with _session_ref_cnt >= num_b_buckets - 1.  Within each
+        # bucket, blocks are in FIFO order (insertion order).  Buckets are
+        # physically ordered by index in the linked list so that popleft
+        # always takes from the lowest-index non-empty bucket, preserving
+        # the "least-bad eviction" semantics.
+        # zone_b_bucket_ends[k] is the last block in bucket k, or None if
+        # the bucket is empty.
+        self.num_b_buckets: int = 10
+        self.zone_b_bucket_ends: list[KVCacheBlock | None] = (
+            [None] * self.num_b_buckets
+        )
+
+        # C zone min-heap: blocks ordered by _ttl_expire_at so that the
+        # earliest-expiring block is always at the heap root.  This lets
+        # lazy_scan_zone_c find expired blocks in O(k log n) instead of
+        # scanning the entire C zone linked list.  The linked list still
+        # holds the blocks physically (in FIFO insertion order, no longer
+        # sorted by TTL), while the heap provides the TTL-ordered index.
+        # Each block's _heap_index tracks its position in the list for
+        # O(log n) removal when it leaves zone C.
+        self.zone_c_heap: list[KVCacheBlock] = []
+        # zone_c_end tracks the tail of the C-zone linked list (or None
+        # when C zone is empty), enabling O(1) FIFO tail insertion.
+        self.zone_c_end: KVCacheBlock | None = None
+
+    # ------------------------------------------------------------------
+    # B-zone bucket helpers
+    # ------------------------------------------------------------------
+    def _get_bucket_index(self, num_session_refs: int) -> int:
+        """Compute the B-zone bucket index for a given session ref count.
+
+        Buckets 0 .. num_b_buckets-2 hold blocks with _session_ref_cnt ==
+        bucket_index.  The last bucket (num_b_buckets-1) holds blocks with
+        _session_ref_cnt >= num_b_buckets-1.
+        """
+        return min(num_session_refs, self.num_b_buckets - 1)
+
+    def _find_b_bucket_insertion_point(
+        self, bucket_idx: int
+    ) -> KVCacheBlock:
+        """Return the block **after which** a new block should be inserted
+        to land at the tail of *bucket_idx*.
+
+        If the bucket is non-empty, returns its current tail (append to
+        bucket).  If the bucket is empty, returns the tail of the nearest
+        non-empty bucket with a lower index, or ``zone1_end`` /
+        ``fake_free_list_head`` when no lower bucket is non-empty.
+        """
+        if self.zone_b_bucket_ends[bucket_idx] is not None:
+            return self.zone_b_bucket_ends[bucket_idx]
+
+        for j in range(bucket_idx - 1, -1, -1):
+            if self.zone_b_bucket_ends[j] is not None:
+                return self.zone_b_bucket_ends[j]
+
+        return self.zone1_end or self.fake_free_list_head
+
+    def _update_zone2_end(self) -> None:
+        """Recompute ``zone2_end`` from bucket tails.
+
+        ``zone2_end`` is always the tail of the highest-index non-empty
+        bucket (or None when all buckets are empty).
+        """
+        for j in range(self.num_b_buckets - 1, -1, -1):
+            if self.zone_b_bucket_ends[j] is not None:
+                self.zone2_end = self.zone_b_bucket_ends[j]
+                return
+        self.zone2_end = None
+
+    def _on_b_block_removed(self, block: KVCacheBlock) -> None:
+        """Update bucket tail and ``zone2_end`` when *block* leaves zone B.
+
+        Must be called **before** the block's ``prev_free_block`` /
+        ``next_free_block`` pointers are modified by the caller, so that
+        the previous block can be inspected to find the new bucket tail.
+        """
+        bucket_idx = block._zone_b_bucket
+        if bucket_idx < 0:
+            return  # Block was not in zone B — nothing to update.
+
+        if self.zone_b_bucket_ends[bucket_idx] is block:
+            # Block was the tail of its bucket; find the new tail by
+            # looking at its predecessor in the linked list.
+            prev = block.prev_free_block
+            if (
+                prev is not None
+                and prev is not self.fake_free_list_head
+                and prev is not self.zone1_end
+                and prev._zone_b_bucket == bucket_idx
+            ):
+                self.zone_b_bucket_ends[bucket_idx] = prev
             else:
-                curr_block = self.fake_free_list_head.next_free_block
+                self.zone_b_bucket_ends[bucket_idx] = None
 
-            while curr_block is not self.fake_free_list_tail:
-                if curr_block is None or curr_block.next_free_block is None:
-                    raise RuntimeError("Invalid block found in popleft() which doesn't have a valid next_free_block")
+        block._zone_b_bucket = -1
+        self._update_zone2_end()
 
-                next_block = curr_block.next_free_block
+    # ------------------------------------------------------------------
+    # C-zone min-heap helpers
+    # ------------------------------------------------------------------
+    def _heap_sift_up(self, idx: int) -> None:
+        """Sift the element at *idx* up to restore min-heap order by
+        ``_ttl_expire_at``."""
+        heap = self.zone_c_heap
+        item = heap[idx]
+        item_ttl = item._ttl_expire_at
+        while idx > 0:
+            parent = (idx - 1) >> 1
+            parent_block = heap[parent]
+            if parent_block._ttl_expire_at <= item_ttl:
+                break
+            heap[idx] = parent_block
+            parent_block._heap_index = idx
+            idx = parent
+        heap[idx] = item
+        item._heap_index = idx
 
-                if curr_block.ttl_expire_at > 0 and time.monotonic() >= curr_block.ttl_expire_at:
-                    curr_block.set_session_state(ttl_expire_at=0.0)
-                    if curr_block.num_session_refs > 0:
-                        self.promote_to_zone_b(curr_block)
-                    else:
-                        self.promote_to_zone_a(curr_block)
+    def _heap_sift_down(self, idx: int) -> None:
+        """Sift the element at *idx* down to restore min-heap order."""
+        heap = self.zone_c_heap
+        n = len(heap)
+        item = heap[idx]
+        item_ttl = item._ttl_expire_at
+        while True:
+            left = 2 * idx + 1
+            right = 2 * idx + 2
+            smallest = idx
+            smallest_ttl = item_ttl
+            if left < n and heap[left]._ttl_expire_at < smallest_ttl:
+                smallest = left
+                smallest_ttl = heap[left]._ttl_expire_at
+            if right < n and heap[right]._ttl_expire_at < smallest_ttl:
+                smallest = right
+                smallest_ttl = heap[right]._ttl_expire_at
+            if smallest == idx:
+                break
+            heap[idx] = heap[smallest]
+            heap[idx]._heap_index = idx
+            idx = smallest
+        heap[idx] = item
+        item._heap_index = idx
 
-                curr_block = next_block
+    def _heap_push(self, block: KVCacheBlock) -> None:
+        """Push *block* onto the C-zone min-heap."""
+        heap = self.zone_c_heap
+        idx = len(heap)
+        heap.append(block)
+        block._heap_index = idx
+        self._heap_sift_up(idx)
+
+    def _heap_pop(self) -> KVCacheBlock:
+        """Pop and return the minimum (earliest-expiring) block."""
+        heap = self.zone_c_heap
+        if not heap:
+            raise IndexError("pop from empty C-zone heap")
+        top = heap[0]
+        last = heap.pop()
+        if heap:
+            heap[0] = last
+            last._heap_index = 0
+            self._heap_sift_down(0)
+        top._heap_index = -1
+        return top
+
+    def _heap_remove(self, block: KVCacheBlock) -> None:
+        """Remove *block* from the C-zone min-heap in O(log n).
+
+        Uses the block's ``_heap_index`` to locate it, replaces it with
+        the last element, then restores heap order.
+        """
+        heap = self.zone_c_heap
+        idx = block._heap_index
+        if idx < 0:
+            return  # Block is not in the heap — nothing to remove.
+        last = heap.pop()
+        if idx < len(heap):
+            heap[idx] = last
+            last._heap_index = idx
+            # Restore order — the displaced element may need to move
+            # up or down depending on its TTL vs the removed block's.
+            if last._ttl_expire_at < block._ttl_expire_at:
+                self._heap_sift_up(idx)
+            else:
+                self._heap_sift_down(idx)
+        block._heap_index = -1
+
+    def _on_c_block_removed(self, block: KVCacheBlock) -> None:
+        """Update heap and zone_c_end when *block* leaves zone C.
+
+        Must be called **before** the block's linked-list pointers are
+        modified by the caller, so that ``prev_free_block`` can be
+        inspected to update ``zone_c_end``.
+        """
+        self._heap_remove(block)
+
+        if self.zone_c_end is block:
+            prev = block.prev_free_block
+            if (
+                prev is not None
+                and prev is not self.fake_free_list_head
+                and prev is not self.zone1_end
+                and prev is not self.zone2_end
+                and prev._heap_index >= 0
+            ):
+                self.zone_c_end = prev
+            else:
+                self.zone_c_end = None
+
+    def lazy_scan_zone_c(self, check_ttl) -> None:
+        """Lazy TTL expiry: pop expired blocks from the C-zone min-heap and
+        promote them to zone A or B.
+
+        Uses the min-heap (ordered by _ttl_expire_at) to find expired blocks
+        in O(k log n) where k is the number of expired blocks, instead of
+        scanning the entire C-zone linked list in O(n).
+        """
+        if not check_ttl:
+            return
+
+        now = time.monotonic()
+        heap = self.zone_c_heap
+
+        # Pop all blocks whose TTL has expired from the heap root.
+        # The heap guarantees the earliest-expiring block is at index 0.
+        while heap and heap[0]._ttl_expire_at > 0 and heap[0]._ttl_expire_at <= now:
+            block = self._heap_pop()
+            block._ttl_expire_at = 0.0
+
+            # Remove the block from the C-zone linked list and promote it.
+            # _heap_pop already set block._heap_index = -1, so
+            # _on_c_block_removed will skip the heap removal; we only need
+            # to update zone_c_end before linked-list pointer manipulation.
+            if self.zone_c_end is block:
+                prev = block.prev_free_block
+                if (
+                    prev is not None
+                    and prev is not self.fake_free_list_head
+                    and prev is not self.zone1_end
+                    and prev is not self.zone2_end
+                    and prev._heap_index >= 0
+                ):
+                    self.zone_c_end = prev
+                else:
+                    self.zone_c_end = None
+
+            if block.num_session_refs > 0:
+                self.promote_to_zone_b(block)
+                logger.debug(
+                    f"lazy_scan_zone_c: Promoted expired C-zone block id {block.block_id} "
+                    f"to zone B."
+                    f"block._session_ref_cnt: {block._session_ref_cnt}. "
+                    f"block._ttl_expire_at: {block._ttl_expire_at}. "
+                )
+            else:
+                self.promote_to_zone_a(block)
+                logger.debug(
+                    f"lazy_scan_zone_c: Promoted expired C-zone block id {block.block_id} "
+                    f"to zone A."
+                    f"block._session_ref_cnt: {block._session_ref_cnt}. "
+                    f"block._ttl_expire_at: {block._ttl_expire_at}. "
+                )
 
     def popleft(self, check_ttl: bool = True) -> KVCacheBlock:
         """Pop from zone A first, then zone B, and reduce num_free_blocks by 1.
-        Zone C is a soft-protection tier used only after zones A and B.
+        Zone C is not allocatable unless a block's TTL has expired. When A/B are
+        empty, lazily scan C and promote expired blocks to A/B.
 
         Returns:
             The first free block.
@@ -125,7 +390,8 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             or self.fake_free_list_head.next_free_block is None
         ):
             assert self.num_free_blocks == 0, (
-                f"num_free_blocks ({self.num_free_blocks}) is out of sync with the free list."
+                f"num_free_blocks ({self.num_free_blocks}) is out of sync "
+                "with the free list."
             )
             raise ValueError("No free blocks available")
 
@@ -136,12 +402,15 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         if first_block.next_free_block is None:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
-            raise RuntimeError("Invalid block found in popleft() which doesn't have a valid next_free_block")
+            raise RuntimeError(
+                "Invalid block found in popleft() "
+                "which doesn't have a valid next_free_block"
+            )
 
         if first_block is self.zone1_end:
             self.zone1_end = None
-        if first_block is self.zone2_end:
-            self.zone2_end = None
+        self._on_b_block_removed(first_block)
+        self._on_c_block_removed(first_block)
 
         # Connect fake_head and the next block of first_block (i.e. second block
         # or fake tail).
@@ -221,15 +490,13 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         next_block = block.next_free_block
 
         if block is self.zone1_end:
-            self.zone1_end = prev_block if prev_block is not self.fake_free_list_head else None
-
-        if block is self.zone2_end:
-            self.zone2_end = (
-                prev_block
-                if (prev_block is not self.fake_free_list_head and prev_block is not self.zone1_end)
-                else None
+            self.zone1_end = (
+                prev_block if prev_block is not self.fake_free_list_head else None
             )
 
+        self._on_b_block_removed(block)
+        self._on_c_block_removed(block)
+        
         # Link the previous block to the next block.
         prev_block.next_free_block = next_block
         # Link the next block to the previous block.
@@ -247,57 +514,47 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             Blocks without session references.
 
         Zone B:
-            Blocks with session references, ordered by num_session_refs ascending.
+            Blocks with session references, grouped into buckets by
+            num_session_refs.  Within each bucket, blocks are in FIFO order.
 
         Zone C:
-            deadline-protected blocks, ordered by _ttl_expire_at ascending.
+            TTL-protected blocks.  The linked list is in FIFO insertion
+            order (no longer sorted by TTL); a min-heap indexed by
+            _ttl_expire_at provides O(log n) TTL-ordered access for
+            lazy_scan_zone_c.
         """
         if self.fake_free_list_tail.prev_free_block is None:
-            raise RuntimeError("prev_free_block of fake_free_list_tail should always exist")
+            raise RuntimeError(
+                "prev_free_block of fake_free_list_tail should always exist"
+            )
 
         if block.is_ephemeral:
             logger.debug(
-                "append: Appending deadline-protected block id %s to zone C.",
+                "append: Appending TTL-protected block id %s to zone C.",
                 block.block_id,
             )
 
-            # C 区位于 A/B 区之后, 按 _ttl_expire_at 升序排列: 小的靠前, 大的靠后
-            prev_block = self.zone2_end or self.zone1_end or self.fake_free_list_head
-            curr_block = prev_block.next_free_block
-
-            while curr_block is not self.fake_free_list_tail:
-                if curr_block is None:
-                    raise RuntimeError("Invalid zone C boundary")
-
-                # 插入到第一个过期时间更大的 block 前面。
-                # 使用 >，使相同 TTL 的 block 保持 FIFO 顺序。
-                if curr_block.ttl_expire_at > block.ttl_expire_at:
-                    break
-
-                prev_block = curr_block
-                curr_block = curr_block.next_free_block
+            # C 区位于 A/B 区之后, 按 FIFO 顺序插入到 C 区尾部.
+            # TTL 排序由 min-heap 维护, 链表不再按 TTL 排序.
+            prev_block = (
+                self.zone_c_end
+                or self.zone2_end
+                or self.zone1_end
+                or self.fake_free_list_head
+            )
+            # O(log n) heap push for TTL-ordered access.
+            self._heap_push(block)
+            self.zone_c_end = block
 
         elif block.num_session_refs > 0 or block.is_offload_block:
             logger.debug("append: Appending block id %s to zone B.", block.block_id)
 
-            # B 区按照 session 引用数量升序排列, 引用少的靠前，引用多的靠后
-            prev_block = self.zone1_end or self.fake_free_list_head
-
-            if self.zone2_end is not None:
-                while prev_block is not self.zone2_end:
-                    curr_block = prev_block.next_free_block
-
-                    if curr_block is None or curr_block is self.fake_free_list_tail:
-                        raise RuntimeError("Invalid zone B boundary")
-
-                    if curr_block.num_session_refs > block.num_session_refs:
-                        break
-
-                    prev_block = curr_block
-
-            # 只有插入到 B 区末尾时才更新 zone2_end。
-            if self.zone2_end is None or prev_block is self.zone2_end:
-                self.zone2_end = block
+            # B 区使用桶分组: 按 _session_ref_cnt 值分桶, 桶内 FIFO.
+            bucket_idx = self._get_bucket_index(block.num_session_refs)
+            block._zone_b_bucket = bucket_idx
+            prev_block = self._find_b_bucket_insertion_point(bucket_idx)
+            self.zone_b_bucket_ends[bucket_idx] = block
+            self._update_zone2_end()
 
         else:
             logger.debug("append: Appending block id %s to zone A.", block.block_id)
@@ -308,7 +565,9 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         next_block = prev_block.next_free_block
         if next_block is None:
-            raise RuntimeError(f"Invalid insertion position for block {block.block_id}")
+            raise RuntimeError(
+                f"Invalid insertion position for block {block.block_id}"
+            )
 
         # Connect the new block after prev_block.
         prev_block.next_free_block = block
@@ -330,17 +589,24 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             return
 
         last_block = self.fake_free_list_tail.prev_free_block
-        assert last_block is not None, "prev_free_block of fake_free_list_tail should always exist"
+        assert last_block is not None, (
+            "prev_free_block of fake_free_list_tail should always exist"
+        )
 
-        only_zone_a_or_empty = self.num_free_blocks == 0 or self.zone1_end is last_block
+        only_zone_a_or_empty = (
+            self.num_free_blocks == 0 or self.zone1_end is last_block
+        )
 
-        blocks_only_zone_a = all(not block.is_ephemeral and block.num_session_refs == 0 for block in blocks)
+        blocks_only_zone_a = all(
+            not block.is_ephemeral and block.num_session_refs == 0
+            for block in blocks
+        )
 
         if not only_zone_a_or_empty or not blocks_only_zone_a:
             for block in blocks:
                 self.append(block)
             return
-
+        
         # Add inter-connections between consecutive blocks
         for block in blocks:
             block.prev_free_block = last_block
@@ -355,6 +621,26 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         self.zone1_end = last_block
 
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        """Get all free blocks in the free list. Mainly used for testing.
+
+        Returns:
+            A list of free blocks.
+        """
+        ret = []
+        if self.fake_free_list_head.next_free_block is None:
+            raise RuntimeError(
+                "next_free_block of fake_free_list_head should always exist"
+            )
+        # Start from the first block
+        curr_block: KVCacheBlock = self.fake_free_list_head.next_free_block
+        # As long as next_free_block is available, we haven't reached to
+        # the fake tail yet.
+        while curr_block.next_free_block is not None:
+            ret.append(curr_block)
+            curr_block = curr_block.next_free_block
+        return ret
+    
     def promote_to_zone_a(self, block: KVCacheBlock) -> None:
         """Move an existing free block to the tail of zone A."""
         if block.prev_free_block is None or block.next_free_block is None:
@@ -367,12 +653,8 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         prev_block = block.prev_free_block
         next_block = block.next_free_block
 
-        if block is self.zone2_end:
-            self.zone2_end = (
-                prev_block
-                if (prev_block is not self.fake_free_list_head and prev_block is not self.zone1_end)
-                else None
-            )
+        self._on_b_block_removed(block)
+        self._on_c_block_removed(block)
 
         prev_block.next_free_block = next_block
         next_block.prev_free_block = prev_block
@@ -391,10 +673,13 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
     def promote_to_zone_b(self, block: KVCacheBlock) -> None:
         """Move an existing free block into zone B.
 
-        Zone B is ordered by session reference count in ascending order.
+        Zone B uses bucket grouping: blocks are placed into buckets by
+        ``_session_ref_cnt``.  Within each bucket, blocks are in FIFO order.
         """
         if block.prev_free_block is None or block.next_free_block is None:
-            raise RuntimeError(f"promote_to_zone_b() called on invalid block: {block}")
+            raise RuntimeError(
+                f"promote_to_zone_b() called on invalid block: {block}"
+            )
 
         # Remove without changing num_free_blocks.
         old_prev = block.prev_free_block
@@ -402,35 +687,29 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         # block 原来是 A 区最后一个节点。
         if block is self.zone1_end:
-            self.zone1_end = old_prev if old_prev is not self.fake_free_list_head else None
-
-        # block 原来是 B 区最后一个节点。
-        if block is self.zone2_end:
-            self.zone2_end = (
-                old_prev if (old_prev is not self.fake_free_list_head and old_prev is not self.zone1_end) else None
+            self.zone1_end = (
+                old_prev if old_prev is not self.fake_free_list_head else None
             )
+
+        # block 原来是 B 区某个桶中的节点。
+        self._on_b_block_removed(block)
+
+        # block 原来是 C 区中的节点 (e.g. lazy_scan 过期后 promote)。
+        self._on_c_block_removed(block)
 
         old_prev.next_free_block = old_next
         old_next.prev_free_block = old_prev
 
-        # 在 B 区内按照 session 引用数量升序寻找插入位置。
-        prev_block = self.zone1_end or self.fake_free_list_head
-
-        if self.zone2_end is not None:
-            while prev_block is not self.zone2_end:
-                curr_block = prev_block.next_free_block
-
-                if curr_block is None or curr_block is self.fake_free_list_tail:
-                    raise RuntimeError("Invalid zone B boundary")
-
-                if curr_block.num_session_refs > block.num_session_refs:
-                    break
-
-                prev_block = curr_block
+        # B 区使用桶分组: 按 _session_ref_cnt 值分桶, 桶内 FIFO.
+        bucket_idx = self._get_bucket_index(block.num_session_refs)
+        block._zone_b_bucket = bucket_idx
+        prev_block = self._find_b_bucket_insertion_point(bucket_idx)
 
         next_block = prev_block.next_free_block
         if next_block is None:
-            raise RuntimeError(f"Invalid zone B insertion position for block {block.block_id}")
+            raise RuntimeError(
+                f"Invalid zone B insertion position for block {block.block_id}"
+            )
 
         prev_block.next_free_block = block
         block.prev_free_block = prev_block
@@ -438,18 +717,25 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         block.next_free_block = next_block
         next_block.prev_free_block = block
 
-        # B 区为空，或者插入在原 B 区末尾时，更新尾节点。
-        if self.zone2_end is None or prev_block is self.zone2_end:
-            self.zone2_end = block
+        self.zone_b_bucket_ends[bucket_idx] = block
+        self._update_zone2_end()
 
+        logger.debug(
+            f"promote_to_zone_b: Promoting block id {block.block_id} to zone B."
+            f"block._session_ref_cnt: {block._session_ref_cnt}. "
+            f"block._ttl_expire_at: {block._ttl_expire_at}. "
+        )
+    
     def promote_to_zone_c(self, block: KVCacheBlock) -> None:
         """Move an existing free block into zone C.
 
-        Zone C is ordered by _ttl_expire_at ascending, so blocks
-        with a larger TTL are placed closer to the end.
+        Zone C linked list is in FIFO insertion order; a min-heap indexed
+        by _ttl_expire_at provides O(log n) TTL-ordered access.
         """
         if block.prev_free_block is None or block.next_free_block is None:
-            raise RuntimeError(f"promote_to_zone_c() called on invalid block: {block}")
+            raise RuntimeError(
+                f"promote_to_zone_c() called on invalid block: {block}"
+            )
 
         # 先从原位置摘除，但不修改 num_free_blocks。
         old_prev = block.prev_free_block
@@ -457,13 +743,15 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         # block 原来是 A 区最后一个节点。
         if block is self.zone1_end:
-            self.zone1_end = old_prev if old_prev is not self.fake_free_list_head else None
-
-        # block 原来是 B 区最后一个节点。
-        if block is self.zone2_end:
-            self.zone2_end = (
-                old_prev if (old_prev is not self.fake_free_list_head and old_prev is not self.zone1_end) else None
+            self.zone1_end = (
+                old_prev if old_prev is not self.fake_free_list_head else None
             )
+
+        # block 原来是 B 区某个桶中的节点。
+        self._on_b_block_removed(block)
+
+        # block 原来是 C 区中的节点 (e.g. TTL 更新后重新定位)。
+        self._on_c_block_removed(block)
 
         old_prev.next_free_block = old_next
         old_next.prev_free_block = old_prev
@@ -471,25 +759,22 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         block.prev_free_block = None
         block.next_free_block = None
 
-        # C 区从 A/B 区之后开始，一直到 fake tail。
-        prev_block = self.zone2_end or self.zone1_end or self.fake_free_list_head
-        curr_block = prev_block.next_free_block
+        # C 区从 A/B 区之后开始, 插入到 C 区尾部 (FIFO 顺序).
+        prev_block = (
+            self.zone_c_end
+            or self.zone2_end
+            or self.zone1_end
+            or self.fake_free_list_head
+        )
 
-        # 按 _ttl_expire_at 升序寻找插入位置。
-        while curr_block is not self.fake_free_list_tail:
-            if curr_block is None:
-                raise RuntimeError("Invalid zone C boundary")
-
-            # 插入到第一个过期时间更大的 block 前面, 相同过期时间保持 FIFO 顺序
-            if curr_block.ttl_expire_at > block.ttl_expire_at:
-                break
-
-            prev_block = curr_block
-            curr_block = curr_block.next_free_block
+        # O(log n) heap push for TTL-ordered access.
+        self._heap_push(block)
 
         next_block = prev_block.next_free_block
         if next_block is None:
-            raise RuntimeError(f"Invalid zone C insertion position for block {block.block_id}")
+            raise RuntimeError(
+                f"Invalid zone C insertion position for block {block.block_id}"
+            )
 
         prev_block.next_free_block = block
         block.prev_free_block = prev_block
@@ -497,6 +782,14 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         block.next_free_block = next_block
         next_block.prev_free_block = block
 
+        self.zone_c_end = block
+
+        logger.debug(
+            f"promote_to_zone_c: Promoting block id {block.block_id} to zone C."
+            f"block._session_ref_cnt: {block._session_ref_cnt}. "
+            f"block._ttl_expire_at: {block._ttl_expire_at}. "
+        )
+    
     def on_block_meta_changed(self, block: KVCacheBlock) -> None:
         """block metadata（_session_ref_cnt 或 _ttl_expire_at）变化后重新评估分区"""
         if block.ref_cnt > 0 or block.is_null:
