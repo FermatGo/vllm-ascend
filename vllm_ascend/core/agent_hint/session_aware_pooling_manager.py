@@ -14,6 +14,7 @@ from vllm.v1.request import Request
 
 from vllm_ascend.core.agent_hint.params import get_agent_hint_params
 from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListener
+from vllm.v1.core.agent_hint_manager import AgentHintManagerContext
 
 
 @dataclass
@@ -175,6 +176,7 @@ class SessionAwarePoolingManager(SessionEventListener):
         kv_cache_manager: KVCacheManager,
         add_request: Callable[[Request], None],
         connector: KVConnectorBase_V1 | None = None,
+        hash_block_size: int = 0,
         config: SPMConfig | None = None,
     ):
         self.kv_cache_manager = kv_cache_manager
@@ -185,9 +187,6 @@ class SessionAwarePoolingManager(SessionEventListener):
         # SessionKeyTracker — PoolKey 跟踪
         self.key_tracker = SessionKeyTracker()
 
-        # PoolingCacheController 模块
-        self.pooling_cache_controller: PoolingCacheController | None = None
-
         # Keep-Alive 线程
         self.keep_alive_thread: KVCacheKeepAliveThread | None = None
 
@@ -197,7 +196,7 @@ class SessionAwarePoolingManager(SessionEventListener):
         # 进行预取中的队列
         self.prefetch_running_queue: list[Request] = []
 
-        self.block_size = 0
+        self.block_size = hash_block_size
 
     def start(self) -> None:
         """初始化PoolingCacheController模块, 启动 Keep-Alive 线程"""
@@ -212,10 +211,6 @@ class SessionAwarePoolingManager(SessionEventListener):
             self.keep_alive_thread.start()
             logger.info("Keep-alive thread start.")
             # 初始化PoolingCacheController
-            self.pooling_cache_controller = PoolingCacheController(
-                connector=self.connector,
-                block_size=self.block_size,
-            )
 
     def stop(self) -> None:
         """停止 Keep-Alive 线程"""
@@ -320,24 +315,6 @@ class SessionAwarePoolingManager(SessionEventListener):
                 f"and failed to add to the queue"
             )
             return False
-
-    def on_context_management_evict(
-        self,
-        block_hashes: list[BlockHash] = None,
-    ) -> int:
-        self.pooling_cache_controller.remove(
-            block_hashes,
-            lazy=False
-        )
-
-    def on_context_management_offload(
-        self,
-        block_hashes: list[BlockHash] = None,
-    ) -> None:
-        self.pooling_cache_controller.remove(
-            block_hashes,
-            lazy=True
-        )
 
     def process_prefetch_req(self, num_unfinished_requests: int) -> list[tuple[str, list[BlockHash]]]:
         """处理预取请求，返回 [(session_id, prefetched_block_hashes), ...] 供 SAM 更新 SSM。"""
@@ -462,4 +439,46 @@ class SessionAwarePoolingManager(SessionEventListener):
 class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
     """Session-aware pooling manager for the Memcache backend."""
 
-    pass
+    def __init__(self,
+        kv_cache_manager: KVCacheManager,
+        add_request: Callable[[Request], None],
+        connector: KVConnectorBase_V1 | None = None,
+        hash_block_size: int | None = None,
+        config: SPMConfig | None = None,):
+        super.__init__(kv_cache_manager, add_request, connector, hash_block_size, config)
+        self.pooling_cache_controller = PoolingCacheController(
+            connector=self.connector,
+            block_size=self.block_size,
+        )
+    def on_context_management_evict(
+        self,
+        block_hashes: list[BlockHash] = None,
+    ) -> int:
+        self.pooling_cache_controller.remove(
+            block_hashes,
+            lazy=False
+        )
+
+    def on_context_management_offload(
+        self,
+        block_hashes: list[BlockHash] = None,
+    ) -> None:
+        self.pooling_cache_controller.remove(
+            block_hashes,
+            lazy=True
+        )
+
+def create_session_aware_pooling_manager(
+    context: AgentHintManagerContext,
+) -> SessionAwarePoolingManager | None:
+    """Create the spm for the mem pool backend."""
+    backend = context.vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", None)
+    if backend == "mooncake":
+        logger.info(f"Init session aware pooling manager for pooling backend {backend}")
+        return SessionAwarePoolingManager(context.kv_cache_manager, context.add_request, context.connector, context.hash_block_size)
+    elif backend == "memcache":
+        logger.info(f"Init session aware pooling manager for pooling backend {backend}")
+        return MemcacheSessionAwarePoolingManager(context.kv_cache_manager, context.add_request, context.connector, context.hash_block_size)
+    else:
+        logger.warning(f"Pooling backend {backend} is not supported yet for session aware pooling manager.")
+        return

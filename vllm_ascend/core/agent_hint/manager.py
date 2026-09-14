@@ -23,7 +23,8 @@ from vllm_ascend.core.agent_hint.session_aware_manager import (
     SessionAwareManager,
 )
 from vllm_ascend.core.agent_hint.session_aware_pooling_manager import (
-    SessionAwarePoolingManager,
+    create_session_aware_pooling_manager,
+    SessionAwarePoolingManager
 )
 
 if TYPE_CHECKING:
@@ -38,13 +39,8 @@ class AscendAgentHintManager(AgentHintManager):
         self._pooling_manager: SessionAwarePoolingManager | None = None
 
         if context.connector is not None:
-            self._pooling_manager = SessionAwarePoolingManager(
-                kv_cache_manager=context.kv_cache_manager,
-                add_request=context.add_request,
-                connector=context.connector,
-            )
+            self._pooling_manager = create_session_aware_pooling_manager(context)
             self._session_manager.add_event_listener(self._pooling_manager)
-            self._pooling_manager.block_size = context.hash_block_size
             self._pooling_manager.start()
 
         context.kv_cache_manager.register_session_event_callbacks(
