@@ -109,10 +109,13 @@ class SessionAwareManager:
         self._event_listeners: list[SessionEventListener] = []
 
         # session state manager
+        num_cache_levels = int(os.environ.get("NUM_CACHE_LEVELS", 2))
+
         self._session_state_manager = SessionStateManager(
             max_sessions=10,
+            num_cache_levels=num_cache_levels,
             on_offload=lambda hashes: self._notify_event("context_management_offload", block_hashes=hashes),
-            on_evict=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes),
+            on_evict=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes) if num_cache_levels == 3 else self._notify_event("context_management_offload", block_hashes=hashes),
         )
 
         # Session 控制器
@@ -153,7 +156,7 @@ class SessionAwareManager:
         logger.info(
             f"on_blocks_allocated_for_request, request_id = {request.request_id}, "
             f"session_id = {hint.session_id if hint else None}, "
-            f"block_ids = {blocks.get_block_ids()}, request.num_output_tokens: {request.num_output_tokens}"
+            f"request.num_output_tokens: {request.num_output_tokens}"
         )
 
         self._on_blocks_allocated(
@@ -173,7 +176,6 @@ class SessionAwareManager:
         logger.info(
             f"on_block_cache_hit_for_request, request_id = {request.request_id}, "
             f"session_id = {hint.session_id if hint else None}, "
-            f"block_ids = {blocks.get_block_ids()}"
         )
 
         self._on_blocks_cache_hit(
@@ -202,7 +204,7 @@ class SessionAwareManager:
         protected_block_hashes: list[BlockHash] = []
 
         for group_id, block_ids in enumerate(blocks.get_block_ids()):
-            logger.info(f"on_blocks_allocated, block_ids={block_ids}")
+            logger.debug(f"on_blocks_allocated, block_ids={block_ids}")
             cached_blocks_len = cached_blocks_len_before[group_id] if cached_blocks_len_before else 0
 
             for ind, block_id in enumerate(block_ids):
@@ -382,7 +384,7 @@ class SessionAwareManager:
 
     def _on_ttl_expired(self, block_id: int, session_id: str) -> None:
         """ephemeral block TTL 到期回调"""
-        logger.info(f"working on _on_ttl_expired in SAM for block {block_id} and session id {session_id}")
+        logger.debug(f"working on _on_ttl_expired in SAM for block {block_id} and session id {session_id}")
 
         group_id = -1
         for group_idx in range(self.num_kv_cache_groups):
@@ -568,7 +570,6 @@ class SessionAwareManager:
 
     def _execute_prefetch(self, session_id: str, block_hashes: list[BlockHash], is_session: bool = False) -> int:
         """通知 SPM 创建远端预取任务。"""
-        # logger.info(f"block_hashes {block_hashes}")
         self._notify_event(
             "context_management_prefetch",
             session_id=session_id,
@@ -1351,9 +1352,9 @@ class SessionController:
 
         if op_result:
             # ── SSM 侧处理（远端状态更新） ──
-            fn = self._execute_ssm_callbacks.get(edit.type)
-            if fn is None:
-                fn(session_id, edit.block_start, edit.block_end,
+            ssm_fn = self._execute_ssm_callbacks.get(edit.type)
+            if ssm_fn is not None:
+                ssm_fn(session_id, edit.block_start, edit.block_end,
                     is_session=is_session_op,)
             # ── SAM 侧处理（HBM block） ──
             if edit.type == "prefetch":
@@ -1514,7 +1515,6 @@ class SessionStateManager:
         self,
         max_sessions: int = 1000,
         num_cache_levels: int = 3,
-        *,
         on_offload: Callable[[list[BlockHash]], None] | None = None,
         on_evict: Callable[[list[BlockHash]], int | None] | None = None,
     ):

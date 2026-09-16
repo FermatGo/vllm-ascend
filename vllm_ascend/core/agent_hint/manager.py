@@ -84,7 +84,7 @@ class AscendAgentHintManager(AgentHintManager):
         self._session_manager.process_prefetch_req(num_unfinished_requests=num_unfinished_requests)
 
     def on_request_finished(self, request: Request) -> None:
-        hint = convert_agent_hint_dict(request.agent_hint)
+        hint = get_agent_hint_params(request)
         session_id = hint.session_id if hint is not None else None
         self._session_manager.on_request_completed(request.request_id, session_id)
 

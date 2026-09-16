@@ -316,6 +316,18 @@ class SessionAwarePoolingManager(SessionEventListener):
             )
             return False
 
+    def on_context_management_evict(
+            self,
+            block_hashes: list[BlockHash] = None,
+    ):
+        pass
+
+    def on_context_management_offload(
+            self,
+            block_hashes: list[BlockHash] = None,
+    ):
+        pass
+
     def process_prefetch_req(self, num_unfinished_requests: int) -> list[tuple[str, list[BlockHash]]]:
         """处理预取请求，返回 [(session_id, prefetched_block_hashes), ...] 供 SAM 更新 SSM。"""
         prefetch_results: list[tuple[str, list[BlockHash]]] = []
@@ -445,7 +457,7 @@ class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
         connector: KVConnectorBase_V1 | None = None,
         hash_block_size: int | None = None,
         config: SPMConfig | None = None,):
-        super.__init__(kv_cache_manager, add_request, connector, hash_block_size, config)
+        super().__init__(kv_cache_manager, add_request, connector, hash_block_size, config)
         self.pooling_cache_controller = PoolingCacheController(
             connector=self.connector,
             block_size=self.block_size,
@@ -453,7 +465,7 @@ class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
     def on_context_management_evict(
         self,
         block_hashes: list[BlockHash] = None,
-    ) -> int:
+    ):
         self.pooling_cache_controller.remove(
             block_hashes,
             lazy=False
@@ -462,7 +474,7 @@ class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
     def on_context_management_offload(
         self,
         block_hashes: list[BlockHash] = None,
-    ) -> None:
+    ):
         self.pooling_cache_controller.remove(
             block_hashes,
             lazy=True

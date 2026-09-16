@@ -337,7 +337,7 @@ class LookupKeyServer:
             zmq.REP,  # type: ignore[attr-defined]
             bind=True,
         )
-
+        self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
         self.pool_worker = pool_worker
         self.running = True
 
