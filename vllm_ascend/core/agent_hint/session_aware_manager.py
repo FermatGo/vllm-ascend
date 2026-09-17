@@ -1168,7 +1168,8 @@ def example_expired_callback(block_id: int, session_id: str) -> None:
 
 
 class SessionController:
-    # TODO: 考虑预取请求有content / session已被清理，重新计算hash
+    # TODO: consider recomputing hashes when a prefetch request has content
+    #       or when the session has already been cleaned up
     """Executor for ``context_management.edits``.
 
     Processes the ``context_management.edits`` carried by a request,
@@ -1177,16 +1178,31 @@ class SessionController:
     block operations through registered callbacks and is agnostic to the
     concrete offload/prefetch/evict implementations.
 
-    Registry callbacks (perform the actual HBM operations)
-    ------------------------------------------------------
-    ``execute_offload``   (block_ids: list[int], session_id: str) -> None
-    ``execute_prefetch``  (block_ids: list[int], session_id: str) -> None
-    ``execute_evict``     (block_ids: list[int], session_id: str) -> None
+    The callbacks come in two categories:
+
+    Execute callbacks (registered in ``_execute_sam_callbacks`` /
+    ``_execute_ssm_callbacks``, keyed by edit type and looked up per edit)
+    ----------------------------------------------------------------------
+    SAM-side callbacks (operate on local HBM blocks):
+      ``execute_offload``   (session_id, block_start, block_end, block_ids_all_group, is_session) -> int
+      ``execute_prefetch``  (session_id, block_hashes, is_session) -> int
+      ``execute_evict``     (session_id, block_start, block_end, block_ids_all_group, is_session) -> int
+    SSM-side callbacks (update remote KV pool state):
+      ``ssm_process_offload`` (session_id, block_start, block_end, is_session) -> None
+      ``ssm_process_evict``   (session_id, block_start, block_end, is_session) -> None
 
     Query callbacks (stored as attributes, invoked directly)
     --------------------------------------------------------
-    ``get_block_hashes_by_session`` (session_id, start, end) -> list[list[BlockHash]]
-    ``get_global_block_id_by_session`` (session_id, start, end) -> list[list[int]]
+    ``get_block_hashes_by_session``  (session_id, block_start, block_end) -> list[BlockHash]
+    ``get_global_block_id_by_session`` (session_id, block_start, block_end) -> tuple[list[int], ...]
+
+    Note:
+      - Blocks/indices are NOT resolved here; each SAM callback resolves the
+        logical range into physical blocks through the query callbacks.
+      - ``prefetch`` is resolved via ``get_block_hashes_by_session`` and
+        forwards the block hashes to the SPM; other edit types resolve via
+        ``get_global_block_id_by_session`` and hand over
+        ``(block_start, block_end, physical block ids, is_session)``.
     """
 
     def __init__(
