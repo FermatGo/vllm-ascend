@@ -373,30 +373,11 @@ class SessionAwareManager:
         """ephemeral block TTL 到期回调"""
         logger.info(f"working on _on_ttl_expired in SAM for block {block_id} and session id {session_id}")
 
-        group_id = -1
-        for group_idx in range(self.num_kv_cache_groups):
-            if block_id in self._block_sessions[group_idx]:
-                group_id = group_idx
-                break
-
-        if group_id == -1:
-            logger.warning(f"can not find block_id: {block_id} in all groups")
-            return
-
-        record = self._block_sessions[group_id].get(block_id, {}).get(session_id)
-        if record is None or not record.is_ephemeral:
-            return
-
-        # 移除 SAM 内部记录
-        self._remove_session_block_ref(session_id, block_id, group_id)
-
         # 统一接口：清除 TTL + 减少 session 引用
         # 这会导致 block 的 is_ephemeral() 返回 False
-        # 且 _session_ref_cnt 减 1
         # FreeKVCacheBlockQueue.on_block_meta_changed 自动重评估分区
         self._update_block_meta(
             block_id,
-            delta_ref=-1,
             ttl_expire_at=0.0,
         )
 
