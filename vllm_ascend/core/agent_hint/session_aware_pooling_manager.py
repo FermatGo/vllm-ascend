@@ -4,6 +4,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from typing import Callable
+import os
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.logger import logger
@@ -462,14 +463,21 @@ class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
             connector=self.connector,
             block_size=self.block_size,
         )
+        self.num_cache_levels = int(os.environ.get("NUM_CACHE_LEVELS", 2))
+
     def on_context_management_evict(
         self,
         block_hashes: list[BlockHash] = None,
     ):
-        self.pooling_cache_controller.remove(
-            block_hashes,
-            lazy=False
-        )
+        if self.num_cache_levels == 2:
+            self.on_context_management_offload(block_hashes)
+        elif self.num_cache_levels == 3:
+            self.pooling_cache_controller.remove(
+                block_hashes,
+                lazy=False
+            )
+        else:
+            logger.warning(f"Unsupported num_cache_levels={self.num_cache_levels}")
 
     def on_context_management_offload(
         self,

@@ -108,12 +108,10 @@ class SessionAwareManager:
         self._event_listeners: list[SessionEventListener] = []
 
         # session state manager
-        num_cache_levels = int(os.environ.get("NUM_CACHE_LEVELS", 2))
-
         self._session_state_manager = SessionStateManager(
             max_sessions=10,
             on_offload=lambda hashes: self._notify_event("context_management_offload", block_hashes=hashes),
-            on_evict=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes) if num_cache_levels == 3 else self._notify_event("context_management_offload", block_hashes=hashes),
+            on_evict=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes),
         )
 
         # Session 控制器
@@ -1328,8 +1326,8 @@ class SessionController:
             f"(block_start={edit.block_start}, block_end={edit.block_end})."
         )
 
-        fn = self._execute_sam_callbacks.get(edit.type)
-        if fn is None:
+        sam_fn = self._execute_sam_callbacks.get(edit.type)
+        if sam_fn is None:
             logger.warning("No callback registered for edit type: %s, skipping.", edit.type)
             return EditResponse(
                 session_id=session_id, type=edit.type, op_status=False, fail_reason=f"invalid edit type {edit.type}"
@@ -1346,25 +1344,25 @@ class SessionController:
         op_result, fail_reason = self.process_edit_index(edit, total_block_length, session_id)
 
         if op_result:
-            # ── SSM 侧处理（远端状态更新） ──
-            ssm_fn = self._execute_ssm_callbacks.get(edit.type)
-            if ssm_fn is not None:
-                ssm_fn(session_id, edit.block_start, edit.block_end,
-                    is_session=is_session_op,)
             # ── SAM 侧处理（HBM block） ──
             if edit.type == "prefetch":
                 get_block_info_fn = self._get_block_hashes_by_session
                 process_session_block_info = get_block_info_fn(session_id, edit.block_start, edit.block_end)
                 process_num = sum(len(info) for info in process_session_block_info)
                 logger.info(f"session {session_id} hash count {process_num}")
-                actual_process_blocks = fn(session_id, process_session_block_info, is_session_op)
+                actual_process_blocks = sam_fn(session_id, process_session_block_info, is_session_op)
             else:
                 get_block_info_fn = self._get_global_block_id_by_session
                 process_session_block_info = get_block_info_fn(session_id, edit.block_start, edit.block_end)
                 process_num = sum(len(info) for info in process_session_block_info)
                 logger.info(f"session {session_id} block id count {process_num}")
-                actual_process_blocks = fn(session_id, edit.block_start, edit.block_end, process_session_block_info,
+                actual_process_blocks = sam_fn(session_id, edit.block_start, edit.block_end, process_session_block_info,
                                            is_session_op)
+            # ── SSM 侧处理（远端状态更新） ──
+            ssm_fn = self._execute_ssm_callbacks.get(edit.type)
+            if ssm_fn is not None:
+                ssm_fn(session_id, edit.block_start, edit.block_end,
+                       is_session=is_session_op, )
 
         return EditResponse(
             session_id=session_id,
