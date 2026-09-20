@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from collections import OrderedDict
-from enum import IntEnum
 
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -113,7 +112,6 @@ class SessionAwareManager:
 
         self._session_state_manager = SessionStateManager(
             max_sessions=10,
-            num_cache_levels=num_cache_levels,
             on_offload=lambda hashes: self._notify_event("context_management_offload", block_hashes=hashes),
             on_evict=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes) if num_cache_levels == 3 else self._notify_event("context_management_offload", block_hashes=hashes),
         )
@@ -1427,67 +1425,52 @@ def compute_ephemeral_range(
         ttl=cache_control.ttl,
     )
 
-class CacheLevel(IntEnum):
-    HBM = 0
-    DDR = 1
-    SSD = 2
-
-
-def _get_bottom_level(num_cache_levels: int) -> CacheLevel:
-    """Return the bottom-most CacheLevel given a configurable number of levels.
-
-    2 levels → HBM, DDR (SSD excluded, bottom=DDR)
-    3 levels → HBM, DDR, SSD  (bottom=SSD)
-    """
-    if num_cache_levels == 2:
-        return CacheLevel.DDR
-    return CacheLevel.SSD
-
-
 @dataclass
 class BlockHashState:
-    """单个 block hash 的完整状态 — 被引用状态 + 缓存位置"""
+    """单个 block hash 的完整状态 — 被引用状态 + offload 阶段计数。
+
+    SSM 不感知 hash 的具体缓存位置，只维护一个 offload 阶段计数：
+    - 0：未 offload（HBM）
+    - 1：已 offload 一级
+    - 2：已下沉到底，达到上限，不能再 offload（进入此阶段时通知 SPM 释放）
+    """
     block_hash: BlockHash
     ref_count: int = 0
     ref_sessions: set[str] = field(default_factory=set)
-    location: CacheLevel = CacheLevel.HBM
     offload_count: int = 0
+    # offload 阶段上限。0→1 只记录状态；1→2 才触发 on_offload 回调通知 SPM。
+    max_offload_count: int = 2
 
     # ── 引用计数操作 ──────────────────────────────────────────────
 
-    def add_ref(self, session_id: str, hashes_by_level: dict[CacheLevel, set[BlockHash]]) -> bool:
-        """增加一个 session 引用。如果 hash 不在 HBM，重置到 HBM。返回是否发生了位置重置。"""
+    def add_ref(self, session_id: str) -> bool:
+        """增加一个 session 引用。返回是否发生了 offload 状态复位。"""
         self.ref_count += 1
         self.ref_sessions.add(session_id)
-        if self.location != CacheLevel.HBM:
-            hashes_by_level[self.location].discard(self.block_hash)
-            hashes_by_level[CacheLevel.HBM].add(self.block_hash)
-            self.location = CacheLevel.HBM
+        if self.offload_count != 0:
             self.offload_count = 0
-            return True  # was reset from lower level to HBM
-        return False  # already in HBM
+            return True  # was reset from offloaded state back to HBM
+        return False  # already in HBM (offload_count == 0)
 
-    def remove_ref(self, session_id: str, hashes_by_level: dict[CacheLevel, set[BlockHash]]) -> bool:
-        """减少一个 session 引用。ref 归零时自动从 hashes_by_level 移除。返回是否已完全释放。"""
+    def remove_ref(self, session_id: str) -> bool:
+        """减少一个 session 引用。ref 归零时即完全释放。返回是否已完全释放。"""
         self.ref_count -= 1
         self.ref_sessions.discard(session_id)
-        if self.ref_count == 0:
-            hashes_by_level[self.location].discard(self.block_hash)
-            return True  # fully released
-        return False
+        return self.ref_count == 0
 
-    # ── 缓存位置操作 ──────────────────────────────────────────────
+    # ── offload 阶段操作 ──────────────────────────────────────────
 
-    def set_location(
-        self, new_location: CacheLevel, new_offload_count: int,
-        hashes_by_level: dict[CacheLevel, set[BlockHash]],
-    ) -> None:
-        """更新缓存位置，同步维护 hashes_by_level 的跨层迁移。"""
-        if self.location != new_location:
-            hashes_by_level[self.location].discard(self.block_hash)
-            hashes_by_level[new_location].add(self.block_hash)
-        self.location = new_location
-        self.offload_count = new_offload_count
+    def offload_once(self) -> bool:
+        """offload 一级。返回是否需要通知 SPM（恰从 1 进入 2）。
+
+        0 → 1：仅内部状态推进，不通知 SPM（数据还在本节点缓存）。
+        1 → 2：下沉到底，此时才需要通知 SPM 真正释放远端数据。
+        已是 2（>= max）：不能再 offload，返回 False。
+        """
+        if self.offload_count >= self.max_offload_count:
+            return False
+        self.offload_count += 1
+        return self.offload_count == self.max_offload_count
 
     # ── 查询 ──────────────────────────────────────────────────────
 
@@ -1506,25 +1489,20 @@ class EvictedSessionInfo:
     still_shared_hashes: list[BlockHash]
 
 class SessionStateManager:
-    """Manages block hash state, cache levels, and LRU eviction."""
+    """Manages block hash state, offload phases, and LRU eviction.
+
+    SSM 不感知 hash 的具体缓存位置，只维护每个 hash 的引用计数与
+    offload 阶段计数（见 BlockHashState）。具体缓存分层由上层 SPM 负责。
+    """
 
     def __init__(
         self,
         max_sessions: int = 1000,
-        num_cache_levels: int = 3,
         on_offload: Callable[[list[BlockHash]], None] | None = None,
         on_evict: Callable[[list[BlockHash]], int | None] | None = None,
     ):
-        self.num_cache_levels = num_cache_levels
-        self._bottom_level = _get_bottom_level(num_cache_levels)
         self._session_block_hash: dict[str, list[BlockHash]] = {}
         self._global_hash_state: dict[BlockHash, BlockHashState] = {}
-        # Only create dict entries for configured cache levels
-        self._hashes_by_level: dict[CacheLevel, set[BlockHash]] = {
-            level: set()
-            for level in CacheLevel
-            if level.value < num_cache_levels
-        }
         self._lru: OrderedDict[str, float] = OrderedDict()
         self._session_hash_count: dict[str, int] = {}
         self._active_session_ids: set[str] = set()  # Sessions with active requests
@@ -1577,14 +1555,13 @@ class SessionStateManager:
         reset_count = 0
         for h in new_hashes:
             if h in self._global_hash_state:
-                if self._global_hash_state[h].add_ref(session_id, self._hashes_by_level):
+                if self._global_hash_state[h].add_ref(session_id):
                     reset_count += 1
             else:
                 self._global_hash_state[h] = BlockHashState(
                     block_hash=h, ref_count=1, ref_sessions={session_id},
-                    location=CacheLevel.HBM, offload_count=0,
+                    offload_count=0,
                 )
-                self._hashes_by_level[CacheLevel.HBM].add(h)
                 new_count += 1
 
         self._session_block_hash[session_id] = new_hashes
@@ -1599,24 +1576,39 @@ class SessionStateManager:
         state = self._global_hash_state.get(block_hash)
         if state is None:
             return False
-        if state.remove_ref(session_id, self._hashes_by_level):
+        if state.remove_ref(session_id):
             del self._global_hash_state[block_hash]
             return True
         return False
 
-    def _batch_update_locations(
-        self, updates: list[tuple[BlockHash, CacheLevel, int]]
-    ) -> None:
-        for block_hash, new_location, new_offload_count in updates:
+    def _batch_offload_once(
+        self, block_hashes: list[BlockHash]
+    ) -> list[BlockHash]:
+        """对每个 hash 推进一次 offload 阶段，返回需要通知 SPM 的 hash。
+
+        新语义：
+        - offload_count 0→1：仅内部状态推进，不回调；
+        - offload_count 1→2：下沉到底，需调用 on_offload 通知 SPM；
+        - 已是 2：不能再 offload，跳过。
+        """
+        to_notify: list[BlockHash] = []
+        for block_hash in block_hashes:
             state = self._global_hash_state.get(block_hash)
             if state is None:
                 continue
-            state.set_location(new_location, new_offload_count, self._hashes_by_level)
-        logger.info("SSM: _batch_update_locations %d hashes updated", len(updates))
+            if state.offload_once():
+                to_notify.append(block_hash)
+        logger.info("SSM: _batch_offload_once %d hashes updated, %d need SPM notify",
+                    len(block_hashes), len(to_notify))
+        return to_notify
 
-    def _get_hashes_with_locations(
+    def _get_hashes_with_offload(
         self, session_id: str, start: int, end: int,
-    ) -> list[tuple[BlockHash, CacheLevel, int]]:
+    ) -> list[tuple[BlockHash, int]]:
+        """Return [(hash, offload_count)] for the session's [start, end) range.
+
+        Hashes without a global state fall back to offload_count=0 (未 offload)。
+        """
         hashes = self._session_block_hash.get(session_id, [])
         if not hashes:
             return []
@@ -1629,10 +1621,7 @@ class SessionStateManager:
         result = []
         for h in hashes[start:end]:
             state = self._global_hash_state.get(h)
-            if state is not None:
-                result.append((h, state.location, state.offload_count))
-            else:
-                result.append((h, CacheLevel.HBM, 0))
+            result.append((h, state.offload_count if state is not None else 0))
         return result
 
     def _filter_hashes_with_active_share(
@@ -1649,49 +1638,55 @@ class SessionStateManager:
         self, session_id: str, block_start: int, block_end: int,
         **kwargs,
     ) -> None:
-        """SSM-side offload: sink hash locations down one level, notify SPM."""
-        hashes_with_locs = self._get_hashes_with_locations(
+        """SSM-side offload: advance each hash's offload phase, notify SPM.
+
+        新语义（SSM 不感知具体缓存位置，只推进 offload_count 阶段）：
+        - 0 → 1：仅内部状态推进，不调用 _on_offload；
+        - 1 → 2：下沉到底（达到 max_offload_count），需要调用 _on_offload
+          通知 SPM 真正释放远端数据；
+        - 2 及以上：已达上限，不能再 offload，跳过。
+        被其他活跃 session 共享的 hash 依旧跳过（多 session 保护）。
+        """
+        hashes_with_offload = self._get_hashes_with_offload(
             session_id, block_start, block_end)
-        if not hashes_with_locs:
+        if not hashes_with_offload:
             logger.info("SSM: process_offload_hashes [%s] no hashes in [%d, %d)", session_id, block_start, block_end)
             return
         logger.info("SSM: process_offload_hashes [%s] %d hashes in [%d, %d)",
-                     session_id, len(hashes_with_locs), block_start, block_end)
+                     session_id, len(hashes_with_offload), block_start, block_end)
 
-        ssm_updates: list[tuple[BlockHash, CacheLevel, int]] = []
-        bottom_skipped = 0
-        for h, loc, cnt in hashes_with_locs:
+        offloadable: list[BlockHash] = []
+        capped_skipped = 0
+        for h, cnt in hashes_with_offload:
             state = self._global_hash_state.get(h)
             if state is None:
                 continue
             # Multi-session protection: skip hashes referenced by other active sessions
             if state.is_shared_with_active_session(session_id, self._is_session_active):
                 continue
-            if loc >= self._bottom_level:
-                bottom_skipped += 1
+            if cnt >= state.max_offload_count:
+                capped_skipped += 1
                 continue
-            new_loc = CacheLevel(loc + 1)
-            new_cnt = cnt + 1
-            ssm_updates.append((h, new_loc, new_cnt))
+            offloadable.append(h)
 
-        if ssm_updates:
-            self._batch_update_locations(ssm_updates)
-            # 统计各级 cache 的分布
-            level_counts: dict[CacheLevel, int] = {}
-            for _, new_loc, _ in ssm_updates:
-                level_counts[new_loc] = level_counts.get(new_loc, 0) + 1
-            level_summary = ", ".join(f"{k.name}={v}" for k, v in sorted(level_counts.items()))
-            msg = f"SSM: process_offload_hashes [{session_id}] {len(ssm_updates)} hashes [{level_summary}]"
-            if bottom_skipped:
-                msg += f", {bottom_skipped} already at bottom"
-            logger.info(msg)
-            self._touch_lru(session_id)
-            if self._on_offload is not None:
-                offloaded_hashes = [h for h, _, _ in ssm_updates]
-                self._on_offload(offloaded_hashes)
-        elif bottom_skipped:
-            logger.info("SSM: process_offload_hashes [%s] no offloadable hashes, %d already at bottom",
-                         session_id, bottom_skipped)
+        if not offloadable:
+            logger.info("SSM: process_offload_hashes [%s] no offloadable hashes%s",
+                         session_id,
+                         f", {capped_skipped} already capped" if capped_skipped else "")
+            return
+
+        # 只推进阶段并返回恰进入底层的 hash（1→2）用于通知 SPM。
+        to_notify = self._batch_offload_once(offloadable)
+
+        msg = f"SSM: process_offload_hashes [{session_id}] {len(offloadable)} hashes advanced"
+        if to_notify:
+            msg += f", {len(to_notify)} reached bottom (notify SPM)"
+        if capped_skipped:
+            msg += f", {capped_skipped} already capped"
+        logger.info(msg)
+        self._touch_lru(session_id)
+        if self._on_offload is not None and to_notify:
+            self._on_offload(to_notify)
 
     def process_evict_hashes(
         self, session_id: str, block_start: int = 0, block_end: int = -1,
@@ -1722,14 +1717,14 @@ class SessionStateManager:
         self, session_id: str, block_start: int, block_end: int,
     ) -> None:
         """Evict a range of hashes for a session. Only freed hashes in callback."""
-        hashes_with_locs = self._get_hashes_with_locations(
+        hashes_with_offload = self._get_hashes_with_offload(
             session_id, block_start, block_end)
-        if not hashes_with_locs:
+        if not hashes_with_offload:
             logger.warning("SSM: process_evict_hashes [%s] no hashes in [%d, %d)",
                          session_id, block_start, block_end)
             return
 
-        target_hashes = [h for h, _, _ in hashes_with_locs]
+        target_hashes = [h for h, _ in hashes_with_offload]
         safe_hashes = self._filter_hashes_with_active_share(target_hashes, session_id)
         shared_count = len(target_hashes) - len(safe_hashes)
 
@@ -1773,23 +1768,23 @@ class SessionStateManager:
     def process_prefetch_hashes(
         self, session_id: str, block_hashes: list[BlockHash],
     ) -> None:
-        """SSM-side prefetch: reset hash locations to HBM.
+        """SSM-side prefetch: reset hash offload phase back to HBM (count=0).
 
-        SPM 在真正预取后调用。对每个 hash 更新位置到 HBM；
-        如果 session 在 SSM 中无记录（被 LRU 淘汰过），自动重建。
+        SPM 在真正预取后调用。对每个 hash 将 offload_count 重置为 0
+        （表示回到 HBM）；如果 session 在 SSM 中无记录（被 LRU 淘汰过），
+        自动重建。
         """
         session_known = session_id in self._session_block_hash
 
         for h in block_hashes:
             state = self._global_hash_state.get(h)
             if state is not None:
-                state.set_location(CacheLevel.HBM, 0, self._hashes_by_level)
+                state.offload_count = 0  # reset to HBM phase
             else:
                 self._global_hash_state[h] = BlockHashState(
                     block_hash=h, ref_count=1, ref_sessions={session_id},
-                    location=CacheLevel.HBM, offload_count=0,
+                    offload_count=0,
                 )
-                self._hashes_by_level[CacheLevel.HBM].add(h)
 
         if not session_known:
             self._session_block_hash[session_id] = block_hashes.copy()
@@ -1833,7 +1828,7 @@ class SessionStateManager:
                 state = self._global_hash_state.get(h)
                 if state is None:
                     continue
-                if state.remove_ref(session_id, self._hashes_by_level):
+                if state.remove_ref(session_id):
                     del self._global_hash_state[h]
                     freed_hashes.append(h)
                 else:
