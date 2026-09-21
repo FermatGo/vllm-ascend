@@ -632,12 +632,13 @@ class SessionAwareManager:
         物理 block 与指定逻辑范围有重叠，就返回该物理 block。
 
         返回 (per-group block id tuple, hash list)。hash list 按
-        hash_block_size 粒度切片，在 for 循环里累积所有 group 实际覆盖
-        范围的并集（min 起点 / max 终点）。每个 group 的切片都是
-        base_block_hashes 的连续子区间，并集等价于 [min(start), max(end))，
-        直接切 base 即保序（是 base 的子切片，顺序与原 list 一致），
-        无需独立 set union 操作。scale_factor 越大的 group 边界 expand
-        得越多，并集自然覆盖所有 group 实际清理范围。
+        hash_block_size 粒度切片，范围是基于 self.block_size 配置算出的
+        所有 group 实际覆盖范围的并集 [min(start), max(end))（不依赖
+        session_blocks 状态，确保多次 offload 后 session_blocks 已被清空
+        时仍能正确切出 hash list —— offload 不清 shared_dict）。每个 group
+        的切片都是 base_block_hashes 的连续子区间，并集等价于
+        [min(start), max(end))，直接切 base 即保序。block_ids 部分依赖
+        session_blocks，session_blocks 已被清空时 result[group_id] 为空。
         """
         result: tuple[list[int], ...] = tuple([] for _ in range(self.num_kv_cache_groups))
 
@@ -666,11 +667,22 @@ class SessionAwareManager:
         if block_start >= block_end:
             return result, []
 
-        # 在 for 循环里累积所有 group 实际覆盖的 hash_block_size 粒度范围
-        # 并集（min 起点 / max 终点）。每个 group 的切片都是 base 的连续
-        # 子区间，并集等价于 [union_start, union_end)，循环外切 base 即保序。
         union_start = block_end
         union_end = block_start
+
+        for group_block_size in self.block_size:
+            assert group_block_size % self.hash_block_size == 0, (
+                f"block_size {group_block_size} is not a multiple of {self.hash_block_size}"
+            )
+            scale_factor = group_block_size // self.hash_block_size
+            group_block_start = block_start // scale_factor
+            group_block_end = (block_end + scale_factor - 1) // scale_factor
+            union_start = min(union_start, group_block_start * scale_factor)
+            union_end = max(union_end, group_block_end * scale_factor)
+        if union_start < union_end:
+            longest_hash_list = list(base_block_hashes[union_start:union_end])
+        else:
+            longest_hash_list = []
 
         for group_id in range(self.num_kv_cache_groups):
             # 获取该 session_id 第 group_id 的 block_ids(即blocks)
@@ -702,11 +714,6 @@ class SessionAwareManager:
 
             if group_block_start >= group_block_end:
                 continue
-
-            # 累积 hash_block_size 粒度并集：group 粒度 × scale_factor 转回
-            # hash_block_size 粒度，min 起点 / max 终点。
-            union_start = min(union_start, group_block_start * scale_factor)
-            union_end = max(union_end, group_block_end * scale_factor)
 
             # 每个 group 建立 [hash: block_id] 映射
             hash_block: dict[BlockHash, int] = {}
@@ -742,13 +749,6 @@ class SessionAwareManager:
 
                 result[group_id].append(block_id)
 
-        # 切 hash list：用 for 循环累积的 [union_start, union_end) 并集，
-        # 直接切 base_block_hashes 即保序。如果没有任何 group 命中
-        # (union_start > union_end)，返回空 list。
-        if union_start < union_end:
-            longest_hash_list = list(base_block_hashes[union_start:union_end])
-        else:
-            longest_hash_list = []
         return result, longest_hash_list
 
     def _get_session_block_hash(self, session_id: str, block_start: int, block_end: int) -> list[BlockHash]:
