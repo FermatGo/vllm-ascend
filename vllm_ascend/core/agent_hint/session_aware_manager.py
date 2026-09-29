@@ -249,12 +249,15 @@ class SessionAwareManager:
                     newly_protected_hashes.append((block_id, block.block_hash))
                     newly_protected_ttl = ttl_expire_at
 
-                # get_new_blocks，已经把物理 block 的 session_ref_cnt 清零。
+                # get_new_blocks，已经把物理 block 的 session 状态清零。
                 # 使用真实 metadata 做校准，可以兼容异常重复回调：
+                # 两个计数同时校准为 1（新引用建立）。
                 current_ref_count = block.num_session_refs
+                current_session_aware_ref = block.session_aware_ref
                 self._update_block_meta(
                     block_id,
                     delta_ref=1 - current_ref_count,
+                    delta_session_aware_ref=1 - current_session_aware_ref,
                     ttl_expire_at=ttl_expire_at,
                 )
 
@@ -365,6 +368,7 @@ class SessionAwareManager:
                     self._update_block_meta(
                         block_id,
                         delta_ref=+1,
+                        delta_session_aware_ref=+1,
                         ttl_expire_at=block_expire_at,
                     )
         if ephemeral_range:
@@ -386,9 +390,11 @@ class SessionAwareManager:
         """ephemeral block TTL 到期回调"""
         logger.debug(f"working on _on_ttl_expired in SAM for block {block_id} and session id {session_id}")
 
-        # 统一接口：清除 TTL + 减少 session 引用
-        # 这会导致 block 的 is_ephemeral() 返回 False
-        # FreeKVCacheBlockQueue.on_block_meta_changed 自动重评估分区
+        # 统一接口：TTL 到期只清除 block 的 TTL，不动两个引用计数
+        # （session record 仍在，num_session_refs 保持为 _block_sessions
+        # 的投影）。这会导致 block 的 is_ephemeral() 返回 False，
+        # FreeKVCacheBlockQueue.on_block_meta_changed 自动重评估分区，
+        # 剩余引用使 block 落入 B 区。
         self._update_block_meta(
             block_id,
             ttl_expire_at=0.0,
@@ -454,7 +460,15 @@ class SessionAwareManager:
                         default=0.0,
                     )
 
-                    self._update_block_meta(block_id, delta_ref=-1, ttl_expire_at=latest_ttl_expire_at)
+                    # 显式驱逐：两个计数同时 -1（_free_session 的两个调用方
+                    # —— _free_session_tree（context_management evict）与
+                    # _force_free_session（SSM LRU 驱逐）—— 都是驱逐语义）。
+                    self._update_block_meta(
+                        block_id,
+                        delta_ref=-1,
+                        delta_session_aware_ref=-1,
+                        ttl_expire_at=latest_ttl_expire_at,
+                    )
 
                     block_ids.append(block_id)
             logger.info(f"free: session id:{session_id}, group_id:{group_id}, block id:{block_ids}")
@@ -533,11 +547,12 @@ class SessionAwareManager:
                     (remaining_record.ttl_expire_at for remaining_record in remaining_records),
                     default=0.0,
                 )
+                # offload 只减少当前引用，不动 session_aware_ref：
+                # block 仍留在 B 区，直到显式 evict 消耗该计数。
                 self._update_block_meta(
                     block_id,
                     delta_ref=-1,
                     ttl_expire_at=latest_ttl_expire_at,
-                    is_offload_block=True,
                 )
                 update_count += 1
 
@@ -600,9 +615,12 @@ class SessionAwareManager:
                     (remaining_record.ttl_expire_at for remaining_record in remaining_records),
                     default=0.0,
                 )
+                # 显式 block-range evict：两个计数同时 -1。record 存在才走到
+                # 这里，重复 evict 时 record 已被移除、直接 continue，保持幂等。
                 self._update_block_meta(
                     block_id,
                     delta_ref=-1,
+                    delta_session_aware_ref=-1,
                     ttl_expire_at=latest_ttl_expire_at,
                 )
 
@@ -834,19 +852,44 @@ class SessionAwareManager:
         self,
         block_id: int,
         delta_ref: int = 0,
+        delta_session_aware_ref: int = 0,
         ttl_expire_at: float | None = None,
-        is_offload_block: bool | None = None,
     ) -> None:
-        """Update Agent Hint metadata and re-evaluate the free queue zone."""
+        """Update Agent Hint metadata and re-evaluate the free queue zone.
+
+        ``delta_ref`` adjusts the current session reference count;
+        ``delta_session_aware_ref`` adjusts the session-aware count that is
+        only consumed by explicit evicts (it replaces the old
+        ``is_offload_block`` flag).  Both are clamped at 0 defensively —
+        an underflow means a double evict/remove, which is logged instead
+        of silently swallowed.
+        """
         block_pool = self.kv_cache_manager.block_pool
         block = block_pool.blocks[block_id]
-        session_ref_cnt = (
-            max(0, block.num_session_refs + delta_ref) if delta_ref != 0 else None
-        )
+        session_ref_cnt = None
+        if delta_ref != 0:
+            new_ref = block.num_session_refs + delta_ref
+            if new_ref < 0:
+                logger.warning(
+                    "_update_block_meta: session ref underflow on block %s "
+                    "(%d + %d), clamping to 0 — possible double evict/remove",
+                    block_id, block.num_session_refs, delta_ref,
+                )
+            session_ref_cnt = max(0, new_ref)
+        session_aware_ref = None
+        if delta_session_aware_ref != 0:
+            new_aware_ref = block.session_aware_ref + delta_session_aware_ref
+            if new_aware_ref < 0:
+                logger.warning(
+                    "_update_block_meta: session_aware_ref underflow on block %s "
+                    "(%d + %d), clamping to 0 — possible double evict",
+                    block_id, block.session_aware_ref, delta_session_aware_ref,
+                )
+            session_aware_ref = max(0, new_aware_ref)
         block.set_session_state(
             session_ref_cnt=session_ref_cnt,
+            session_aware_ref=session_aware_ref,
             ttl_expire_at=ttl_expire_at,
-            is_offload_block=is_offload_block,
         )
         if block.ref_cnt == 0 and not block.is_null:
             block_pool.free_block_queue.on_block_meta_changed(block)
