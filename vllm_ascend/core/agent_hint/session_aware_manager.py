@@ -1538,12 +1538,21 @@ class BlockHashState:
     - 1: offloaded one level
     - 2: sunk to bottom, reached the cap, cannot offload further (entering
       this phase triggers SPM notification to release remote data)
+
+    ``block_ids`` lists the physical block ids that currently hold this
+    hash across all KV cache groups. SSM itself does not consume this
+    field for ref/offload bookkeeping; it is metadata for upstream layers
+    (SAM/SPM) to locate the concrete blocks when an offload/evict is
+    materialized. Maintained by SAM on alloc/cache-hit/free.
     """
     block_hash: BlockHash
     ref_count: int = 0
     ref_sessions: set[str] = field(default_factory=set)
     offload_count: int = 0
     max_offload_count: int = 2
+    # Physical block ids holding this hash across all groups. Duplicates
+    # are ignored; removal is by value.
+    block_ids: list[int] = field(default_factory=list)
 
     def add_ref(self, session_id: str) -> bool:
         """Add a session reference. Returns whether offload_count was reset."""
@@ -1583,6 +1592,34 @@ class BlockHashState:
             return False
         other_sessions = self.ref_sessions - {requesting_session}
         return any(is_active_fn(sid) for sid in other_sessions)
+
+    def add_block_id(self, block_id: int) -> None:
+        """Register a physical block holding this hash.
+
+        Idempotent: duplicate calls with the same block_id do not append
+        a second entry. SAM calls this on alloc / cache-hit once the
+        block↔hash mapping is established.
+        """
+        if block_id not in self.block_ids:
+            self.block_ids.append(block_id)
+
+    def remove_block_id(self, block_id: int) -> bool:
+        """Unregister a physical block.
+
+        Returns True if the block was present and removed; False if it
+        was not found (no-op, logged at debug level — happens on
+        duplicate free or when the hash was never materialized in that
+        block).
+        """
+        try:
+            self.block_ids.remove(block_id)
+            return True
+        except ValueError:
+            logger.warning(
+                "BlockHashState.remove_block_id: block %s not found for hash %s",
+                block_id, self.block_hash,
+            )
+            return False
 
 @dataclass
 class EvictedSessionInfo:
