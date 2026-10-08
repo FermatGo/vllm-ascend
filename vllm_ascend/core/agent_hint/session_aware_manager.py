@@ -109,13 +109,12 @@ class SessionAwareManager:
         # 事件监听器列表
         self._event_listeners: list[SessionEventListener] = []
 
-        # session state manager — shares the _session_block_hash reference with SSM
         self._session_state_manager = SessionStateManager(
             max_sessions=10,
-            session_block_hash=self._session_block_hash,
-            on_offload=lambda hashes: self._notify_event("context_management_offload", block_hashes=hashes),
-            on_evict=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes),
-            force_free_session_fn=self._force_free_session,
+            session_hash_state=self._session_block_hash,  # TODO: rename to self._session_hash_state
+            hash_state={},                             # TODO: self._hash_state (SAM 侧待新增)
+            apply_evict_remote_cache_fn=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes),
+            apply_evict_kvblock_fn=self.apply_evict_kvblock,
         )
 
         # Session 控制器
@@ -125,8 +124,8 @@ class SessionAwareManager:
             execute_evict=self._execute_evict,
             get_global_block_id_by_session=self._get_session_global_block_ids,
             get_block_hashes_by_session=self._get_session_block_hash,
-            ssm_process_offload=self._session_state_manager.process_offload_hashes,
-            ssm_process_evict=self._session_state_manager.process_evict_hashes,
+            ssm_process_offload=self._session_state_manager.classify_offload_work,
+            ssm_process_evict=self._session_state_manager.classify_evict_work,
           )
 
     def on_blocks_allocated_for_request(
@@ -948,6 +947,27 @@ class SessionAwareManager:
                 if record and record.is_ephemeral:
                     self._ttl_manager.remove(block_id, old_session_id)
 
+    def apply_offload_kvblock(
+        self,
+        hbm_work: list[BlockHashState],
+    ) -> None:
+        """SAM 侧 HBM apply for offload (TODO 待实现)."""
+        return
+
+    def apply_evict_kvblock(
+        self,
+        session_id: str,
+        work: list[tuple[BlockHashState, list[int]]],
+        is_session_op: bool,
+    ) -> list[BlockHash]:
+        """SAM 侧 HBM + TTL apply for evict (TODO 待实现).
+
+        Signature matches ``apply_evict_kvblock_fn`` callback expected
+        by SSM. Prefixed with ``_`` because it's bound as a callback
+        (not meant to be called directly by callers other than SSM).
+        """
+        return []
+
 
 @dataclass
 class TTLBlockEntry:
@@ -1467,7 +1487,12 @@ class SessionController:
 
                 ssm_fn = self._execute_ssm_callbacks.get(edit.type)
                 if ssm_fn is not None:
-                    ssm_fn(session_id, hashes_for_ssm, is_session=is_session_op)
+                    #TODO: 传入根据边界切割后的state list
+                    states_for_ssm = [
+                        st for h in hashes_for_ssm
+                        if (st := self._session_state_manager._hash_state.get(h)) is not None
+                    ]
+                    ssm_fn(session_id, states_for_ssm)
 
         return EditResponse(
             session_id=session_id,
@@ -1539,11 +1564,11 @@ class BlockHashState:
     - 2: sunk to bottom, reached the cap, cannot offload further (entering
       this phase triggers SPM notification to release remote data)
 
-    ``block_ids`` lists the physical block ids that currently hold this
-    hash across all KV cache groups. SSM itself does not consume this
-    field for ref/offload bookkeeping; it is metadata for upstream layers
-    (SAM/SPM) to locate the concrete blocks when an offload/evict is
-    materialized. Maintained by SAM on alloc/cache-hit/free.
+    ``block_ids_per_group`` lists the physical block ids that currently
+    hold this hash across all KV cache groups. SSM itself does not consume
+    this field for ref/offload bookkeeping; it is metadata for upstream
+    layers (SAM/SPM) to locate the concrete blocks when an offload/evict
+    is materialized. Maintained by SAM on alloc/cache-hit/free.
     """
     block_hash: BlockHash
     ref_count: int = 0
@@ -1552,7 +1577,7 @@ class BlockHashState:
     max_offload_count: int = 2
     # Physical block ids holding this hash across all groups. Duplicates
     # are ignored; removal is by value.
-    block_ids: list[int] = field(default_factory=list)
+    block_ids_per_group: list[int] = field(default_factory=list)
 
     def add_ref(self, session_id: str) -> bool:
         """Add a session reference. Returns whether offload_count was reset."""
@@ -1600,8 +1625,8 @@ class BlockHashState:
         a second entry. SAM calls this on alloc / cache-hit once the
         block↔hash mapping is established.
         """
-        if block_id not in self.block_ids:
-            self.block_ids.append(block_id)
+        if block_id not in self.block_ids_per_group:
+            self.block_ids_per_group.append(block_id)
 
     def remove_block_id(self, block_id: int) -> bool:
         """Unregister a physical block.
@@ -1612,7 +1637,7 @@ class BlockHashState:
         block).
         """
         try:
-            self.block_ids.remove(block_id)
+            self.block_ids_per_group.remove(block_id)
             return True
         except ValueError:
             logger.warning(
@@ -1620,13 +1645,6 @@ class BlockHashState:
                 block_id, self.block_hash,
             )
             return False
-
-@dataclass
-class EvictedSessionInfo:
-    """LRU eviction result."""
-    session_id: str
-    freed_hashes: list[BlockHash]
-    still_shared_hashes: list[BlockHash]
 
 
 class SessionLRU:
@@ -1692,343 +1710,233 @@ class SessionLRU:
 
 
 class SessionStateManager:
-    """Manages block hash state, offload phases, and LRU eviction.
+    """Session state manager — hash 维度状态权威 + LRU 驱逐自编排。
 
-    SSM is agnostic about the concrete cache location of a hash; it only
-    maintains per-hash reference counts and an offload phase counter (see
-    ``BlockHashState``). Concrete cache tiering is handled by the upstream
-    SPM.
+    SSM 共享 SAM 的两张表（构造时传入同一份 dict 引用）：
+      - ``_session_hash_state: dict[sid, list[BlockHashState]]``：session →
+        BlockHashState 列表（保序）。SAM 写入初始 list，SSM 负责
+        trim / pop（evict / LRU 驱逐时）。
+      - ``_hash_state: dict[BlockHash, BlockHashState]``：hash → state
+        全局反查。SAM 创建 entry（register 时），SSM 负责增删 entry
+        + 改字段（ref_count / ref_sessions / offload_count）。
 
-    ``_session_block_hash`` is the **same dict reference** shared with SAM
-    (passed in by SAM at construction time). SSM does not create its own
-    copy. SAM is the authority: it writes/deletes entries on register/evict;
-    SSM only reads through the shared reference (e.g. to fetch a candidate
-    session's hash list during LRU eviction). On LRU eviction SSM notifies
-    SAM to delete the entry via ``_force_free_session_fn``.
+    SSM 是 state 的权威维护者：分类时读 state 字段做分类，同时改
+    state（ref_count / ref_sessions / offload_count / 增删 _hash_state /
+    trim / pop _session_hash_state）。SSM 不直接改 HBM block
+    （``block.sessions`` / ``set_session_state``），HBM apply 通过
+    callback 调 SAM 完成。
 
-    SSM does **not** perceive parent/child sessions — it only processes
-    the single ``session_id`` passed to it. On LRU eviction SSM asks SAM
-    to free that one session via ``_force_free_session_fn`` (bound to
-    SAM's non-recursive ``_free_session``). Child sessions are not
-    touched by SSM LRU eviction; they remain in SAM/SSM state until
-    individually evicted or until an upper layer that owns parent/child
-    semantics cleans them up. SessionController's session-evict path
-    (user-initiated) still uses SAM's recursive ``_free_session_tree``
-    and does clean the whole subtree — that path is separate from SSM
-    LRU eviction.
+    SSM 不感知父子 session —— 只处理传入的单个 ``session_id``。LRU
+    驱逐也只处理单个 top-level session，children 由上层维护。
     """
 
     def __init__(
         self,
         max_sessions: int = 1000,
-        session_block_hash: dict[str, list[BlockHash]] | None = None,
-        on_offload: Callable[[list[BlockHash]], None] | None = None,
-        on_evict: Callable[[list[BlockHash]], int | None] | None = None,
-        force_free_session_fn: Callable[[str], list[BlockHash]] | None = None,
+        session_hash_state: dict[str, list[BlockHashState]] | None = None,
+        hash_state: dict[BlockHash, BlockHashState] | None = None,
+        apply_evict_remote_cache_fn: Callable[[list[BlockHash]], int | None] | None = None,
+        apply_evict_kvblock_fn: Callable[[str, list[tuple[BlockHashState, list[int]]], bool], list[BlockHash]] | None = None,
     ):
-        # Shared dict reference with SAM — passed in by SAM at construction.
-        # SAM is the authority; SSM does not write to it directly. On LRU
-        # eviction SSM asks SAM to delete the entry via
-        # _force_free_session_fn.
-        self._session_block_hash: dict[str, list[BlockHash]] = (
-            session_block_hash if session_block_hash is not None else {}
+        self._session_hash_state: dict[str, list[BlockHashState]] = (
+            session_hash_state if session_hash_state is not None else {}
         )
-        self._global_hash_state: dict[BlockHash, BlockHashState] = {}
+        self._hash_state: dict[BlockHash, BlockHashState] = (
+            hash_state if hash_state is not None else {}
+        )
         self._lru = SessionLRU(max_sessions=max_sessions)
-        self._active_session_ids: set[str] = set()  # Sessions with active requests
+        self._active_session_ids: set[str] = set()
 
-        # SPM callbacks for context management notifications
-        self._on_offload = on_offload
-        self._on_evict = on_evict
-        self._force_free_session_fn = force_free_session_fn
+        self._apply_evict_remote_cache_fn = apply_evict_remote_cache_fn
+        self._apply_evict_kvblock_fn = apply_evict_kvblock_fn
 
     # ════════════════════════════════════════════════════════════════
-    # Active session tracking (notified by SAM on request alloc/free)
+    # Active session tracking
     # ════════════════════════════════════════════════════════════════
 
     def mark_session_active(self, session_id: str) -> None:
-        """Mark session as having active requests."""
         if session_id not in self._active_session_ids:
             logger.info("SSM: mark_session_active [%s]", session_id)
             self._active_session_ids.add(session_id)
 
     def mark_session_inactive(self, session_id: str) -> None:
-        """Mark session as having no active requests."""
         if session_id in self._active_session_ids:
             logger.info("SSM: mark_session_inactive [%s]", session_id)
             self._active_session_ids.discard(session_id)
 
     def _is_session_active(self, session_id: str) -> bool:
-        """Check if the session currently has active requests."""
         return session_id in self._active_session_ids
 
     def set_session_block_hashes(
         self, session_id: str, new_hashes: list[BlockHash],
     ) -> None:
-        """Update BlockHashState according to the new hash list.
-
-        Relies on call ordering (approach 2): SAM calls this method first
-        in ``register_session_block_hash``, then overwrites
-        ``shared_dict[sid] = new_list``. So reading
-        ``shared_dict.get(sid, [])`` here returns **old_hashes**, enabling
-        a diff.
+        """Diff-register hashes: update BlockHashState ref_count/ref_sessions.
 
         Diff strategy (only handle added/removed, leave common alone):
-          - removed (old - new): ``_unregister_hash`` decrements ref_count;
-            when it hits 0 the state is deleted.
-          - added   (new - old): create a new state or call ``add_ref``
-            (which resets offload_count to 0).
-          - common  (old & new): left untouched — avoids accidentally
-            resetting offload_count of a hash that has been referenced
-            all along, or letting ref_count cross 0 and triggering state
-            delete-then-recreate.
-
-        Does not write shared_dict — SAM writes it after this method returns.
+          - removed (old - new): decrement ref_count; if 0, del _hash_state.
+          - added   (new - old): create state or add_ref (resets offload_count).
+          - common  (old & new): untouched — avoids resetting offload_count
+            of a long-held hash or triggering state delete-then-recreate.
         """
-        old_hashes = self._session_block_hash.get(session_id, [])
-        old_set = set(old_hashes)
+        # TODO:确认sam调用的时间点及_session_hash_state的更新，目前接口暂未更新_session_hash_state
+        old_states = self._session_hash_state.get(session_id, [])
+        old_hashes = {s.block_hash for s in old_states}
         new_set = set(new_hashes)
 
-        removed = [h for h in old_hashes if h not in new_set]
-        added = [h for h in new_hashes if h not in old_set]
-        if len(removed) > 0 or len(added) > 0:
+        removed = [s for s in old_states if s.block_hash not in new_set]
+        added = [h for h in new_hashes if h not in old_hashes]
+        if removed or added:
             logger.info("SSM: set_session_block_hashes [%s] %d -> %d hashes (added=%d, removed=%d)",
-                         session_id, len(old_hashes), len(new_hashes), len(added), len(removed))
+                         session_id, len(old_states), len(new_hashes), len(added), len(removed))
 
-        for h in removed:
-            self._unregister_hash(h, session_id)
+        for state in removed:
+            if state.remove_ref(session_id):
+                del self._hash_state[state.block_hash]
 
         new_count = 0
         reset_count = 0
         for h in added:
-            state = self._global_hash_state.get(h)
+            state = self._hash_state.get(h)
             if state is not None:
                 if state.add_ref(session_id):
                     reset_count += 1
             else:
-                self._global_hash_state[h] = BlockHashState(
+                self._hash_state[h] = BlockHashState(
                     block_hash=h, ref_count=1, ref_sessions={session_id},
                     offload_count=0,
                 )
                 new_count += 1
 
         logger.info("SSM: set_session_block_hashes [%s] %d new global entries, %d reset to HBM, total managed hashes=%d",
-                      session_id, new_count, reset_count, len(self._global_hash_state))
+                      session_id, new_count, reset_count, len(self._hash_state))
         self._lru.set_hash_count(session_id, len(new_hashes))
         self.mark_session_active(session_id)
         self._lru.touch(session_id)
 
-    def _unregister_hash(self, block_hash: BlockHash, session_id: str) -> bool:
-        """Unregister a session's reference to a hash. Returns True if the hash was fully freed."""
-        state = self._global_hash_state.get(block_hash)
-        if state is None:
-            return False
-        if state.remove_ref(session_id):
-            del self._global_hash_state[block_hash]
-            return True
-        return False
+    # ════════════════════════════════════════════════════════════════
+    # Classify offload work — Controller 调用
+    # ════════════════════════════════════════════════════════════════
 
-    def _batch_offload_once(
-        self, block_hashes: list[BlockHash]
-    ) -> list[BlockHash]:
-        """Advance each hash's offload phase by one, return hashes that need SPM notification.
+    def classify_offload_work(
+        self, session_id: str, states: list[BlockHashState],
+    ) -> dict[str, list]:
+        """Classify states for offload + advance offload_count at classify time.
 
-        Semantics:
-        - offload_count 0->1: internal state advance only, no callback;
-        - offload_count 1->2: sunk to bottom, must call on_offload to notify SPM;
-        - already at 2: cannot offload further, skipped.
+        State attributes are updated here (SSM owns them): ``offload_count``
+        is advanced via ``offload_once()``, and ``block_ids_per_group`` is
+        cleared after the offload action (HBM no longer holds these blocks).
+
+        Returns OffloadWork dict:
+          - ``hbm_work``:   [(state, block_ids_per_group_snapshot) for state in first_offload_states]
+                            offload_count 0→1, Controller → sam.apply_offload_kvblock
+          - ``remote_work``: [state.block_hash for state in second_offload_states]
+                            offload_count 1→2, Controller → spm.on_context_management_offload
+          - ``skipped``:    [state for state in active_shared_or_max_reached]
+                            no change
         """
-        to_notify: list[BlockHash] = []
-        for block_hash in block_hashes:
-            state = self._global_hash_state.get(block_hash)
-            if state is None:
-                continue
-            if state.offload_once():
-                to_notify.append(block_hash)
-        logger.info("SSM: _batch_offload_once %d hashes updated, %d need SPM notify",
-                    len(block_hashes), len(to_notify))
-        return to_notify
-
-    def _filter_hashes_with_active_share(
-        self, hashes: list[BlockHash], requesting_session: str,
-    ) -> list[BlockHash]:
-        filtered = []
-        for h in hashes:
-            state = self._global_hash_state.get(h)
-            if state is None or not state.is_shared_with_active_session(requesting_session, self._is_session_active):
-                filtered.append(h)
-        return filtered
-
-    def process_offload_hashes(
-        self, session_id: str, block_hashes: list[BlockHash],
-    ) -> None:
-        """SSM-side offload: advance the offload phase of the input hashes, notify SPM when needed.
-
-        The input hashes are resolved by SessionController via
-        ``_get_session_block_hash`` and passed in; SSM no longer senses
-        start/end or slices shared_dict itself.
-
-        Filter rule: hashes shared by other active sessions are skipped via
-        ``_filter_hashes_with_active_share`` (multi-session protection).
-        Unlike evict, offload has no ref_count gate — without the explicit
-        filter, ``offload_once`` would advance the phase of a hash still in
-        use by an active session.
-
-        Semantics on the remaining hashes:
-        - 0 -> 1: internal state advance only, no _on_offload callback;
-        - 1 -> 2: sunk to bottom (reached max_offload_count), call
-          _on_offload to notify SPM;
-        - >= 2: already at cap, skipped.
-        """
-        logger.info("SSM: process_offload_hashes [%s] %d hashes",
-                    session_id, len(block_hashes))
-        if not block_hashes:
-            return
-
-        safe_hashes = self._filter_hashes_with_active_share(block_hashes, session_id)
-        active_share_skipped = len(block_hashes) - len(safe_hashes)
-        if not safe_hashes:
-            logger.info("SSM: process_offload_hashes [%s] all %d hashes protected by active sessions",
-                         session_id, len(block_hashes))
-            return
-
-        offloadable: list[BlockHash] = []
-        capped_skipped = 0
-        for h in safe_hashes:
-            state = self._global_hash_state.get(h)
-            if state is None:
+        hbm_work: list[tuple[BlockHashState, list[int]]] = []
+        remote_work: list[BlockHash] = []
+        skipped: list[BlockHashState] = []
+        for state in states:
+            if state.is_shared_with_active_session(session_id, self._is_session_active):
+                skipped.append(state)
                 continue
             if state.offload_count >= state.max_offload_count:
-                capped_skipped += 1
+                skipped.append(state)
                 continue
-            offloadable.append(h)
+            reached_bottom = state.offload_once()
+            # offload 后 HBM 不再持有这些 block，清空 state.block_ids_per_group
+            block_ids_snapshot = list(state.block_ids_per_group)
+            state.block_ids_per_group = []
+            if reached_bottom:
+                remote_work.append(state.block_hash)
+            else:
+                hbm_work.append((state, block_ids_snapshot))
 
-        if not offloadable:
-            logger.info("SSM: process_offload_hashes [%s] no offloadable hashes%s%s",
-                         session_id,
-                         f", {capped_skipped} already capped" if capped_skipped else "",
-                         f", {active_share_skipped} active-share protected" if active_share_skipped else "")
-            return
-
-        to_notify = self._batch_offload_once(offloadable)
-
-        msg = f"SSM: process_offload_hashes [{session_id}] {len(offloadable)} hashes advanced"
-        if to_notify:
-            msg += f", {len(to_notify)} reached bottom (notify SPM)"
-        if capped_skipped:
-            msg += f", {capped_skipped} already capped"
-        if active_share_skipped:
-            msg += f", {active_share_skipped} active-share protected"
-        logger.info(msg)
+        logger.info("SSM: classify_offload_work [%s] hbm=%d remote=%d skipped=%d",
+                     session_id, len(hbm_work), len(remote_work), len(skipped))
         self._lru.touch(session_id)
-        if self._on_offload is not None and to_notify:
-            self._on_offload(to_notify)
+        return {"hbm_work": hbm_work, "remote_work": remote_work, "skipped": skipped}
 
-    def process_evict_hashes(
-        self, session_id: str, block_hashes: list[BlockHash],
-        is_session: bool = False,
-    ) -> None:
-        """SSM-side evict: unregister references on the input hashes, notify SPM when needed.
+    # ════════════════════════════════════════════════════════════════
+    # Classify evict work — Controller 调用
+    # ════════════════════════════════════════════════════════════════
 
-        The input hashes are resolved by SessionController and passed in.
-        ``is_session=True`` means the whole session is being evicted (SAM has
-        already done ``del shared_dict[sid]``); SSM unregisters the refs and
-        also clears the LRU entry. ``is_session=False`` is a range evict,
-        the session still exists in shared_dict (SAM has already updated the
-        dict to drop the evicted hashes); SSM only unregisters refs and
-        touches the LRU entry to refresh freshness, leaving the entry in
-        place.
+    def classify_evict_work(
+        self,
+        session_id: str,
+        states: list[BlockHashState],
+    ) -> dict[str, list[tuple[BlockHashState, list[int]]]]:
+        """Classify states for evict + mutate state at classify time.
+
+        Returns EvictWork dict:
+          - ``hbm_only_work``:      [(state, block_ids_per_group) for state in still_shared_states]
+                                    ref_sessions 还有其他 session（非 active）, 仅减 ref (state 保留)
+          - ``hbm_and_remote_work``: [(state, block_ids_per_group) for state in exclusive_states]
+                                    ref_sessions 只剩当前 sid, SSM 已删 state entry
+          - ``skipped``:            [state for state in active_share_protected]
+                                    no change
+          Each work entry is ``(state, block_ids_snapshot)`` — snapshot
+          taken before the block list is cleared, so callers can still
+          locate the concrete HBM blocks to release.
         """
-        if is_session:
-            self._process_session_evict(session_id, block_hashes)
-        else:
-            self._process_range_evict(session_id, block_hashes)
-
-    def _process_session_evict(
-        self, session_id: str, block_hashes: list[BlockHash],
-    ) -> None:
-        """Evict all hashes for a session and remove it from the LRU.
-
-        Only freed hashes (ref_count hit 0) are forwarded to the on_evict
-        callback.
-        """
-        if not self._lru.is_managed(session_id):
-            logger.info("SSM: process_evict_hashes [%s] session evict skipped, already evicted from LRU", session_id)
-            return
-        logger.info("SSM: process_evict_hashes [%s] session evict %d hashes",
-                     session_id, len(block_hashes))
-        freed = self._evict_hashes(session_id, block_hashes)
-        # SAM already did del shared_dict[sid]; SSM only clears its own LRU.
-        self._lru.remove(session_id)
-        if self._on_evict is not None and freed:
-            self._on_evict(freed)
-
-    def _process_range_evict(
-        self, session_id: str, block_hashes: list[BlockHash],
-    ) -> None:
-        """Evict the input hash list. shared_dict is maintained by SAM, SSM does not touch it.
-
-        No explicit active-share filter: ``_evict_hashes`` calls
-        ``remove_ref`` on every hash and only frees the ones whose ref_count
-        hits 0 (i.e. not shared by any other session, active or inactive).
-        Hashes still referenced by other sessions keep their state and are
-        not forwarded to ``_on_evict``. This unifies the filter rule with
-        ``_process_session_evict`` and avoids leaking the requesting
-        session's ref when SAM has already removed the hash from
-        shared_dict.
-        """
-        if not block_hashes:
-            logger.warning("SSM: process_evict_hashes [%s] no hashes", session_id)
-            return
-
-        freed_hashes = self._evict_hashes(session_id, block_hashes)
-        still_shared_count = len(block_hashes) - len(freed_hashes)
-
-        logger.info("SSM: process_evict_hashes [%s] %d freed, %d still shared (of %d target)",
-                     session_id, len(freed_hashes), still_shared_count,
-                     len(block_hashes))
-
-        # shared_dict is maintained by SAM; if the session still has remaining
-        # hashes, refresh LRU freshness and update the hash-count key so LRU
-        # eviction candidate ranking reflects the post-evict count.
-        remaining = self._session_block_hash.get(session_id)
-        if remaining:
-            self._lru.touch(session_id)
-            self._lru.set_hash_count(session_id, len(remaining))
-
-        if self._on_evict is not None and freed_hashes:
-            self._on_evict(freed_hashes)
-
-    def _evict_hashes(
-        self, session_id: str, block_hashes: list[BlockHash],
-    ) -> list[BlockHash]:
-        """Unregister a batch of hashes for the given session; return hashes whose ref_count hit 0 and were actually deleted."""
-        freed: list[BlockHash] = []
-        for h in block_hashes:
-            state = self._global_hash_state.get(h)
-            if state is None:
+        hbm_only_work: list[tuple[BlockHashState, list[int]]] = []
+        hbm_and_remote_work: list[tuple[BlockHashState, list[int]]] = []
+        skipped: list[BlockHashState] = []
+        for state in states:
+            if state.is_shared_with_active_session(session_id, self._is_session_active):
+                skipped.append(state)
                 continue
-            if state.remove_ref(session_id):
-                del self._global_hash_state[h]
-                freed.append(h)
-        return freed
+            state.ref_sessions.discard(session_id)
+            state.ref_count = max(0, state.ref_count - 1)
+            block_ids_snapshot = list(state.block_ids_per_group)
+            # 无 active 共享即可清空 block 归属（与 offload 一致），
+            # 不必等 ref_count == 0。
+            state.block_ids_per_group = []
+            if state.ref_count == 0:
+                del self._hash_state[state.block_hash]
+                hbm_and_remote_work.append((state, block_ids_snapshot))
+            else:
+                hbm_only_work.append((state, block_ids_snapshot))
+
+        # SSM bookkeeping on _session_hash_state + LRU.
+        # is_session_op: states 覆盖了该 session 全部 state → 整 session evict。
+        session_states = self._session_hash_state.get(session_id, [])
+        is_session_op = len(states) >= len(session_states)
+        if is_session_op:
+            self._session_hash_state.pop(session_id, None)
+            self._lru.remove(session_id)
+        else:
+            # range evict: 从 _session_hash_state[sid] 里剔除本轮 evict 的 state。
+            # 用 block_hash 集合做差集，避免残留已被 del _hash_state 的僵尸引用。
+            evicted_hashes = {s.block_hash for s in states}
+            old = self._session_hash_state.get(session_id)
+            if old is not None:
+                self._session_hash_state[session_id] = [
+                    s for s in old if s.block_hash not in evicted_hashes
+                ]
+            remaining = self._session_hash_state.get(session_id)
+            if remaining:
+                self._lru.touch(session_id)
+                self._lru.set_hash_count(session_id, len(remaining))
+
+        logger.info("SSM: classify_evict_work [%s] hbm_only=%d hbm_and_remote=%d skipped=%d (is_session=%s)",
+                     session_id, len(hbm_only_work), len(hbm_and_remote_work), len(skipped), is_session_op)
+        return {"hbm_only_work": hbm_only_work, "hbm_and_remote_work": hbm_and_remote_work, "skipped": skipped}
+
+    # ════════════════════════════════════════════════════════════════
+    # Prefetch — SPM 完成后调 SSM 复位 offload_count
+    # ════════════════════════════════════════════════════════════════
 
     def process_prefetch_hashes(
         self, session_id: str, block_hashes: list[BlockHash],
     ) -> None:
-        """SSM-side prefetch: reset the offload_count of the input hashes back to 0 (HBM).
-
-        Does not rebuild shared_dict — if the session has already been LRU
-        evicted (not in shared_dict), only reset offload_count on the
-        existing BlockHashState entries; the next time the session becomes
-        active, ``register_session_block_hash`` will rebuild the dict entry
-        through the normal path.
-        """
+        """Reset offload_count of the input hashes back to 0 (HBM)."""
         if not block_hashes:
             return
         reset_count = 0
         for h in block_hashes:
-            state = self._global_hash_state.get(h)
+            state = self._hash_state.get(h)
             if state is not None and state.offload_count != 0:
                 state.offload_count = 0
                 reset_count += 1
@@ -2038,22 +1946,7 @@ class SessionStateManager:
             self._lru.touch(session_id)
 
     def _try_evict_if_needed(self) -> None:
-        """Proactively evict one inactive session when the LRU is full.
-
-        Notifies SAM via ``_force_free_session_fn`` to free the entry.
-        SSM only processes the single top-level ``sid`` — it does **not**
-        perceive parent/child, and SAM's ``_free_session`` (non-recursive)
-        only frees the current session's own data (``_sessions``,
-        ``_session_blocks``, ``_block_sessions``, TTL, ``shared_dict``
-        for that one sid). Child sessions are not touched; they're left
-        for a higher layer to handle.
-
-        ``get_evict_candidates`` excludes active sessions by
-        ``active_session_ids`` (candidate itself only). Children of an
-        evicted parent stay in SAM/SSM state — they'll be cleaned up
-        when they individually become LRU victims or when an upper layer
-        explicitly evicts them.
-        """
+        """Proactively evict one inactive session when LRU is full."""
         if not self._lru.is_full():
             return
         candidates = self._lru.get_evict_candidates(
@@ -2062,16 +1955,36 @@ class SessionStateManager:
             return
 
         sid = candidates[0]
-        logger.info("SSM: _try_evict_if_needed LRU full (%d >= %d), evicting [%s] (single session, no subtree)",
+        logger.info("SSM: _try_evict_if_needed LRU full (%d >= %d), evicting [%s]",
                      len(self._lru), self._lru.max_sessions, sid)
-        # Ask SAM to free; returns flat hash list (SAM flattens internally).
-        flat_hashes: list[BlockHash] = []
-        if self._force_free_session_fn is not None:
-            flat_hashes = self._force_free_session_fn(sid) or []
 
-        # SSM processes all hashes under the single top-level sid.
-        freed = self._evict_hashes(sid, flat_hashes)
-        self._lru.remove(sid)
-        if self._on_evict is not None and freed:
-            self._on_evict(freed)
+        # 1. slice states (whole session)
+        states = self._session_hash_state.get(sid, [])
+        if not states:
+            self._lru.remove(sid)
+            return
+
+        # 2. classify + mutate state (pop _session_hash_state + remove LRU inside)
+        evict_work = self.classify_evict_work(sid, states)
+        hbm_only_work = evict_work["hbm_only_work"]
+        hbm_and_remote_work = evict_work["hbm_and_remote_work"]
+
+        # 3. SAM applies HBM + TTL
+        freed_hashes: list[BlockHash] = []
+        if self._apply_evict_kvblock_fn is not None:
+            all_work = hbm_only_work + hbm_and_remote_work
+            freed_hashes = self._apply_evict_kvblock_fn(
+                sid, all_work, True) or []
+
+        # 4. notify SPM (freed = exclusive hashes, safe to delete remote)
+        if self._apply_evict_remote_cache_fn is not None and freed_hashes:
+            self._apply_evict_remote_cache_fn(freed_hashes)
+
+        logger.info(
+            "SSM: _try_evict_if_needed [%s] done — states=%d hbm_only=%d "
+            "hbm_and_remote=%d skipped=%d freed_hashes=%d (spm_notified=%s)",
+            sid, len(states), len(hbm_only_work), len(hbm_and_remote_work),
+            len(evict_work.get("skipped", [])), len(freed_hashes),
+            bool(freed_hashes) and self._apply_evict_remote_cache_fn is not None,
+        )
 
