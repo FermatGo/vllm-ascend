@@ -1946,45 +1946,52 @@ class SessionStateManager:
             self._lru.touch(session_id)
 
     def _try_evict_if_needed(self) -> None:
-        """Proactively evict one inactive session when LRU is full."""
-        if not self._lru.is_full():
-            return
-        candidates = self._lru.get_evict_candidates(
-            count=1, active_session_ids=self._active_session_ids)
-        if not candidates:
-            return
+        """Proactively evict inactive sessions until the LRU is no longer full.
 
-        sid = candidates[0]
-        logger.info("SSM: _try_evict_if_needed LRU full (%d >= %d), evicting [%s]",
-                     len(self._lru), self._lru.max_sessions, sid)
+        Drives one session per iteration; re-checks ``is_full`` after each
+        eviction so a multi-session overflow is fully drained in one call.
+        Stops early if no inactive candidate is available (avoids spinning
+        while all remaining sessions are active).
+        """
+        remaining_budget = len(self._lru)
+        while self._lru.is_full() and remaining_budget > 0:
+            remaining_budget -= 1
+            candidates = self._lru.get_evict_candidates(
+                count=1, active_session_ids=self._active_session_ids)
+            if not candidates:
+                return
 
-        # 1. slice states (whole session)
-        states = self._session_hash_state.get(sid, [])
-        if not states:
-            self._lru.remove(sid)
-            return
+            sid = candidates[0]
+            logger.info("SSM: _try_evict_if_needed LRU full (%d >= %d), evicting [%s]",
+                         len(self._lru), self._lru.max_sessions, sid)
 
-        # 2. classify + mutate state (pop _session_hash_state + remove LRU inside)
-        evict_work = self.classify_evict_work(sid, states)
-        hbm_only_work = evict_work["hbm_only_work"]
-        hbm_and_remote_work = evict_work["hbm_and_remote_work"]
+            # 1. slice states (whole session)
+            states = self._session_hash_state.get(sid, [])
+            if not states:
+                self._lru.remove(sid)
+                continue
 
-        # 3. SAM applies HBM + TTL
-        freed_hashes: list[BlockHash] = []
-        if self._apply_evict_kvblock_fn is not None:
-            all_work = hbm_only_work + hbm_and_remote_work
-            freed_hashes = self._apply_evict_kvblock_fn(
-                sid, all_work, True) or []
+            # 2. classify + mutate state (pop _session_hash_state + remove LRU inside)
+            evict_work = self.classify_evict_work(sid, states)
+            hbm_only_work = evict_work["hbm_only_work"]
+            hbm_and_remote_work = evict_work["hbm_and_remote_work"]
 
-        # 4. notify SPM (freed = exclusive hashes, safe to delete remote)
-        if self._apply_evict_remote_cache_fn is not None and freed_hashes:
-            self._apply_evict_remote_cache_fn(freed_hashes)
+            # 3. SAM applies HBM + TTL
+            freed_hashes: list[BlockHash] = []
+            if self._apply_evict_kvblock_fn is not None:
+                all_work = hbm_only_work + hbm_and_remote_work
+                freed_hashes = self._apply_evict_kvblock_fn(
+                    sid, all_work, True) or []
 
-        logger.info(
-            "SSM: _try_evict_if_needed [%s] done — states=%d hbm_only=%d "
-            "hbm_and_remote=%d skipped=%d freed_hashes=%d (spm_notified=%s)",
-            sid, len(states), len(hbm_only_work), len(hbm_and_remote_work),
-            len(evict_work.get("skipped", [])), len(freed_hashes),
-            bool(freed_hashes) and self._apply_evict_remote_cache_fn is not None,
-        )
+            # 4. notify SPM (freed = exclusive hashes, safe to delete remote)
+            if self._apply_evict_remote_cache_fn is not None and freed_hashes:
+                self._apply_evict_remote_cache_fn(freed_hashes)
+
+            logger.info(
+                "SSM: _try_evict_if_needed [%s] done — states=%d hbm_only=%d "
+                "hbm_and_remote=%d skipped=%d freed_hashes=%d (spm_notified=%s)",
+                sid, len(states), len(hbm_only_work), len(hbm_and_remote_work),
+                len(evict_work.get("skipped", [])), len(freed_hashes),
+                bool(freed_hashes) and self._apply_evict_remote_cache_fn is not None,
+            )
 
