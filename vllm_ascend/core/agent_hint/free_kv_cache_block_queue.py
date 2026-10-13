@@ -4,7 +4,7 @@
 """Ascend Agent Hint free-block eviction policy."""
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import (
@@ -15,15 +15,17 @@ from vllm.v1.core.kv_cache_utils import (
 
 @dataclass(slots=True)
 class AgentHintKVCacheBlock(KVCacheBlock):
-    # Current session-to-block references. Projection of the number of
-    # SessionBlockRecords in SAM's _block_sessions[group_id][block_id].
-    _session_ref_cnt: int = 0
-    # Accumulated session-aware references. Incremented together with
-    # _session_ref_cnt when a session reference is established; decremented
-    # ONLY by explicit evict, so offloaded/re-referenced blocks stay in
-    # zone B until evicted or physically reallocated. Replaces the old
-    # sticky _is_offload_block boolean.
-    _session_aware_ref: int = 0
+    # Sessions currently referencing this block (block → session reverse
+    # index). Written by SAM on allocate / cache-hit; discarded on evict;
+    # cleared when the block's cached hash is wiped for reuse. SSM never
+    # touches this field.
+    # Zone-B membership is derived: len(sessions) > 0 keeps the block in
+    # zone B (offload does not touch sessions, so offloaded blocks stay
+    # anchored until explicitly evicted or physically reused — replacing
+    # both the old _is_offload_block flag and the dual-counter scheme;
+    # design §7.1 decision: compute len() instead of caching a counter,
+    # len(set) is O(1) and no set/counter drift is possible).
+    _sessions: set[str] = field(default_factory=set)
     _ttl_expire_at: float = 0.0
     # Bucket index in zone B (-1 when the block is not in zone B).
     # Set by FreeKVCacheBlockQueue when the block is inserted into a B-zone
@@ -36,8 +38,12 @@ class AgentHintKVCacheBlock(KVCacheBlock):
     _heap_index: int = -1
 
     @property
+    def sessions(self) -> set[str]:
+        return self._sessions
+
+    @property
     def num_session_refs(self) -> int:
-        return self._session_ref_cnt
+        return len(self._sessions)
 
     @property
     def ttl_expire_at(self) -> float:
@@ -46,10 +52,6 @@ class AgentHintKVCacheBlock(KVCacheBlock):
     @property
     def is_ephemeral(self) -> bool:
         return self._ttl_expire_at > 0 and time.monotonic() < self._ttl_expire_at
-
-    @property
-    def session_aware_ref(self) -> int:
-        return self._session_aware_ref
 
     @property
     def zone_b_bucket(self) -> int:
@@ -62,16 +64,10 @@ class AgentHintKVCacheBlock(KVCacheBlock):
     def set_session_state(
         self,
         *,
-        session_ref_cnt: int | None = None,
-        session_aware_ref: int | None = None,
         ttl_expire_at: float | None = None,
         zone_b_bucket: int | None = None,
         heap_index: int | None = None,
     ) -> None:
-        if session_ref_cnt is not None:
-            self._session_ref_cnt = session_ref_cnt
-        if session_aware_ref is not None:
-            self._session_aware_ref = session_aware_ref
         if ttl_expire_at is not None:
             self._ttl_expire_at = ttl_expire_at
         if zone_b_bucket is not None:
@@ -80,8 +76,7 @@ class AgentHintKVCacheBlock(KVCacheBlock):
             self._heap_index = heap_index
 
     def reset_session_state(self) -> None:
-        self._session_ref_cnt = 0
-        self._session_aware_ref = 0
+        self._sessions.clear()
         self._ttl_expire_at = 0.0
         self._zone_b_bucket = -1
         self._heap_index = -1
@@ -112,8 +107,8 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         super().__init__(blocks)
 
-        # A zone: allocatable blocks without any session refs (both
-        #         _session_ref_cnt and _session_aware_ref are 0).
+        # A zone: allocatable blocks without any session refs
+        #         (len(sessions) == 0).
         # B zone: allocatable blocks with session refs — either a current
         #         session ref or a session-aware ref not yet consumed by an
         #         explicit evict.
@@ -122,10 +117,10 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         self.zone1_end: KVCacheBlock | None = blocks[-1] if blocks else None
         self.zone2_end: KVCacheBlock | None = None
 
-        # B zone bucketing: blocks are grouped by _session_ref_cnt into
+        # B zone bucketing: blocks are grouped by num_session_refs into
         # buckets.  Bucket k (0 <= k < num_b_buckets - 1) holds blocks with
-        # _session_ref_cnt == k.  The last bucket (num_b_buckets - 1) holds
-        # blocks with _session_ref_cnt >= num_b_buckets - 1.  Within each
+        # num_session_refs == k.  The last bucket (num_b_buckets - 1) holds
+        # blocks with num_session_refs >= num_b_buckets - 1.  Within each
         # bucket, blocks are in FIFO order (insertion order).  Buckets are
         # physically ordered by index in the linked list so that popleft
         # always takes from the lowest-index non-empty bucket, preserving
@@ -156,9 +151,9 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
     def _get_bucket_index(self, num_session_refs: int) -> int:
         """Compute the B-zone bucket index for a given session ref count.
 
-        Buckets 0 .. num_b_buckets-2 hold blocks with _session_ref_cnt ==
+        Buckets 0 .. num_b_buckets-2 hold blocks with num_session_refs ==
         bucket_index.  The last bucket (num_b_buckets-1) holds blocks with
-        _session_ref_cnt >= num_b_buckets-1.
+        num_session_refs >= num_b_buckets-1.
         """
         return min(num_session_refs, self.num_b_buckets - 1)
 
@@ -370,12 +365,12 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
                 else:
                     self.zone_c_end = None
 
-            if block.num_session_refs > 0 or block.session_aware_ref > 0:
+            if block.num_session_refs > 0:
                 self.promote_to_zone_b(block)
                 logger.debug(
                     f"lazy_scan_zone_c: Promoted expired C-zone block id {block.block_id} "
                     f"to zone B."
-                    f"block._session_ref_cnt: {block._session_ref_cnt}. "
+                    f"block.num_session_refs: {block.num_session_refs}. "
                     f"block._ttl_expire_at: {block._ttl_expire_at}. "
                 )
             else:
@@ -383,7 +378,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
                 logger.debug(
                     f"lazy_scan_zone_c: Promoted expired C-zone block id {block.block_id} "
                     f"to zone A."
-                    f"block._session_ref_cnt: {block._session_ref_cnt}. "
+                    f"block.num_session_refs: {block.num_session_refs}. "
                     f"block._ttl_expire_at: {block._ttl_expire_at}. "
                 )
 
@@ -521,13 +516,13 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         num_free_blocks by 1.
 
         Zone A:
-            Blocks without any session references — both num_session_refs
-            and session_aware_ref are 0.
+            Blocks without any session references (num_session_refs == 0,
+            i.e. len(sessions) == 0).
 
         Zone B:
-            Blocks with session references (num_session_refs > 0 or
-            session_aware_ref > 0), grouped into buckets by
-            num_session_refs.  Within each bucket, blocks are in FIFO order.
+            Blocks with session references (num_session_refs > 0), grouped
+            into buckets by num_session_refs.  Within each bucket, blocks
+            are in FIFO order.
 
         Zone C:
             TTL-protected blocks.  The linked list is in FIFO insertion
@@ -558,10 +553,10 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             self._heap_push(block)
             self.zone_c_end = block
 
-        elif block.num_session_refs > 0 or block.session_aware_ref > 0:
+        elif block.num_session_refs > 0:
             logger.debug("append: Appending block id %s to zone B.", block.block_id)
 
-            # B 区使用桶分组: 按 _session_ref_cnt 值分桶, 桶内 FIFO.
+            # B 区使用桶分组: 按 num_session_refs 值分桶, 桶内 FIFO.
             bucket_idx = self._get_bucket_index(block.num_session_refs)
             block._zone_b_bucket = bucket_idx
             prev_block = self._find_b_bucket_insertion_point(bucket_idx)
@@ -610,9 +605,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         )
 
         blocks_only_zone_a = all(
-            not block.is_ephemeral
-            and block.num_session_refs == 0
-            and block.session_aware_ref == 0
+            not block.is_ephemeral and block.num_session_refs == 0
             for block in blocks
         )
 
@@ -688,7 +681,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         """Move an existing free block into zone B.
 
         Zone B uses bucket grouping: blocks are placed into buckets by
-        ``_session_ref_cnt``.  Within each bucket, blocks are in FIFO order.
+        ``num_session_refs``.  Within each bucket, blocks are in FIFO order.
         """
         if block.prev_free_block is None or block.next_free_block is None:
             raise RuntimeError(
@@ -714,7 +707,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         old_prev.next_free_block = old_next
         old_next.prev_free_block = old_prev
 
-        # B 区使用桶分组: 按 _session_ref_cnt 值分桶, 桶内 FIFO.
+        # B 区使用桶分组: 按 num_session_refs 值分桶, 桶内 FIFO.
         bucket_idx = self._get_bucket_index(block.num_session_refs)
         block._zone_b_bucket = bucket_idx
         prev_block = self._find_b_bucket_insertion_point(bucket_idx)
@@ -736,7 +729,7 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         logger.debug(
             f"promote_to_zone_b: Promoting block id {block.block_id} to zone B."
-            f"block._session_ref_cnt: {block._session_ref_cnt}. "
+            f"block.num_session_refs: {block.num_session_refs}. "
             f"block._ttl_expire_at: {block._ttl_expire_at}. "
         )
     
@@ -800,19 +793,19 @@ class AgentHintFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
 
         logger.debug(
             f"promote_to_zone_c: Promoting block id {block.block_id} to zone C."
-            f"block._session_ref_cnt: {block._session_ref_cnt}. "
+            f"block.num_session_refs: {block.num_session_refs}. "
             f"block._ttl_expire_at: {block._ttl_expire_at}. "
         )
     
     def on_block_meta_changed(self, block: KVCacheBlock) -> None:
-        """block metadata（_session_ref_cnt 或 _ttl_expire_at）变化后重新评估分区"""
+        """block metadata（sessions 或 _ttl_expire_at）变化后重新评估分区"""
         if block.ref_cnt > 0 or block.is_null:
             return  # block 被活跃请求使用，不在 free queue 中
 
         if block.is_ephemeral:
             # C区：ephemeral 保护中，不可分配
             self.promote_to_zone_c(block)
-        elif block.num_session_refs > 0 or block.session_aware_ref > 0:
+        elif block.num_session_refs > 0:
             # B区：无 ephemeral 保护，但当前 session 引用或
             # session-aware 引用（尚未被显式 evict 消耗）仍存在
             self.promote_to_zone_b(block)

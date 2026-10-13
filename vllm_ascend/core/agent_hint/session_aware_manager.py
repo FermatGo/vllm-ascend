@@ -13,8 +13,6 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
-    BlockHashListWithBlockSize,
-    BlockHashWithGroupId,
     KVCacheBlock,
     get_block_hash,
 )
@@ -32,29 +30,6 @@ from vllm_ascend.core.agent_hint.session_event_listener import SessionEventListe
 # the affected blocks. Disabled by default (no TTL registered on offload).
 _ENABLE_OFFLOAD_TTL_PROTECT = os.getenv("VLLM_ASCEND_OFFLOAD_TTL_PROTECT",
                                           "false").lower() in ("true", "1")
-
-
-@dataclass
-class SessionBlockRecord:
-    """单个 session 对单个 block 的引用记录（仅在 SAM 内部维护）"""
-
-    session_id: str
-    block_id: int
-    is_ephemeral: bool = False  # 是否受 cache_control ephemeral 保护
-    ttl_expire_at: float = 0.0  # ephemeral block 的 TTL 过期时间，0 表示无限制
-    created_at: float = 0.0  # 记录创建时间
-    block_hash: BlockHashWithGroupId | None = None  # 记录创建时的 block hash，便于调试
-
-
-@dataclass
-class SessionInfo:
-    """Session 注册信息"""
-
-    session_id: str
-    parent_session_id: str | None = None
-    children: set[str] = field(default_factory=set)
-    request_ids: set[str] = field(default_factory=set)  # 关联的请求 ID
-    created_at: float = 0.0
 
 
 @dataclass
@@ -78,30 +53,35 @@ class EditResponse:
 
 
 class SessionAwareManager:
-    """Session-Aware Manager — 管理 session 生命周期与 block 映射"""
+    """Session-Aware Manager — HBM 物理资源 + TTL 的权威维护者。
 
-    # TODO：是否已实现分配的时候有ttl才保护
-    # TODO：没空间是C区可开放，远程保持访问、保护
+    数据结构（设计 §2.2.3）：两张权威表 + block 字段。
+
+    - ``_session_hashes: dict[sid, list[BlockHashState]]`` — session → 按
+      hash_block_size 粒度保序的 BlockHashState 列表。与 SSM 共享同一份
+      dict 引用：SAM 只读 / 切片（register 时由 SSM 写入初始 list，
+      evict 时由 SSM trim / pop）。
+    - ``_hash_state: dict[BlockHash, BlockHashState]`` — 基础 hash 全局反查。
+      与 SSM 共享同一份 dict 引用：SAM 只读（allocate/hit 时填
+      ``block_ids_per_group``），SSM 负责增删 entry 与字段维护。
+    - ``block.sessions: set[str]`` — block → session 反向索引（替代原
+      ``_block_sessions`` 3D 表），由本类在 allocate / cache-hit 路径写入，
+      在 evict / hash 复用清理时 discard / clear。
+
+    不再维护：``_sessions``（父子表，父子语义由上层维护）、
+    ``_session_blocks`` / ``_block_sessions``（双向索引表）、
+    ``_session_block_hash``（原始 hash 列表表）。
+    """
+
     def __init__(self, kv_cache_manager: KVCacheManager):
         self.kv_cache_manager = kv_cache_manager
         self.num_kv_cache_groups = kv_cache_manager.num_kv_cache_groups
         self.block_size = tuple(sprc.block_size for sprc in self.kv_cache_manager.coordinator.single_type_managers)
         self.hash_block_size = self.kv_cache_manager.block_pool.hash_block_size
 
-        # Session注册表(session间的层级关系): session_id → SessionInfo
-        self._sessions: dict[str, SessionInfo] = {}
-        # session_id → {block_id → SessionBlockRecord}
-        self._session_blocks: list[dict[str, dict[int, SessionBlockRecord]]] = [
-            {} for _ in range(self.num_kv_cache_groups)
-        ]
-        # 反向索引：block_id → {session_id → SessionBlockRecord}
-        self._block_sessions: list[dict[int, dict[str, SessionBlockRecord]]] = [
-            {} for _ in range(self.num_kv_cache_groups)
-        ]
-        # 只维护当前"请求"的hash表 — 与 SSM 共享同一份 dict 引用。
-        # SAM 是这份 dict 的权威：register/evict 时由 SAM 写入/删除；
-        # SSM 通过 _force_free_session_fn 在 LRU evict 时通知 SAM 删除 entry。
-        self._session_block_hash: dict[str, list[BlockHash]] = {}
+        # 两张权威表（与 SSM 共享同一份 dict 引用）
+        self._session_hashes: dict[str, list[BlockHashState]] = {}
+        self._hash_state: dict[BlockHash, BlockHashState] = {}
 
         # TTL 管理器（定时轮）
         self._ttl_manager = TTLManager(on_expired=self._on_ttl_expired, notify_func=self._notify_event)
@@ -111,22 +91,23 @@ class SessionAwareManager:
 
         self._session_state_manager = SessionStateManager(
             max_sessions=10,
-            session_hash_state=self._session_block_hash,  # TODO: rename to self._session_hash_state
-            hash_state={},                             # TODO: self._hash_state (SAM 侧待新增)
-            apply_evict_remote_cache_fn=lambda hashes: self._notify_event("context_management_evict", block_hashes=hashes),
+            session_hash_state=self._session_hashes,
+            hash_state=self._hash_state,
+            apply_evict_remote_cache_fn=self._on_session_evicted_remote,
             apply_evict_kvblock_fn=self.apply_evict_kvblock,
         )
 
-        # Session 控制器
+        # Session 控制器（三层编排：SAM 切片 → SSM 分类+改 state → SAM apply + SPM 远端）
         self._session_controller = SessionController(
-            execute_offload=self._execute_offload,
-            execute_prefetch=self._execute_prefetch,
-            execute_evict=self._execute_evict,
-            get_global_block_id_by_session=self._get_session_global_block_ids,
+            get_hash_states_for_range=self.get_session_hash_states_for_range,
             get_block_hashes_by_session=self._get_session_block_hash,
-            ssm_process_offload=self._session_state_manager.classify_offload_work,
-            ssm_process_evict=self._session_state_manager.classify_evict_work,
-          )
+            execute_prefetch=self._execute_prefetch,
+            apply_offload_kvblock=self.apply_offload_kvblock,
+            apply_evict_kvblock=self.apply_evict_kvblock,
+            ssm_classify_offload=self._session_state_manager.classify_offload_work,
+            ssm_classify_evict=self._session_state_manager.classify_evict_work,
+            spm_notify=self._notify_event,
+        )
 
     def on_blocks_allocated_for_request(
         self, request: Request, blocks: KVCacheBlocks, cached_blocks_len_before: tuple[int, ...] | None = None
@@ -141,14 +122,11 @@ class SessionAwareManager:
                 for block_id in block_ids:
                     block = self._get_block(block_id)
 
+                    # 清理该物理 block 的所有旧 session 引用（含 TTL 与 state 反向清理）
+                    self.clear_block_session_refs(block_id)
+
                     # block本身清理的session_ref_cnt和ttl_expire_at
                     self._reset_block_state(block)
-
-                    # 清理TTLManager中这个物理 block 的所有旧 session 引用
-                    self._clear_old_block_sessions_ttl(block_id)
-
-                    # 清理SAM中这个物理 block 的所有旧 session 引用。
-                    self._clear_block_session_refs(block_id)
             return
 
         is_prefill = request.num_output_tokens == 0
@@ -158,13 +136,13 @@ class SessionAwareManager:
             f"request.num_output_tokens: {request.num_output_tokens}"
         )
 
-        self._on_blocks_allocated(
+        self._register_blocks_to_session(
             session_id=hint.session_id,
-            parent_session_id=hint.parent_session_id,
             blocks=blocks,
             ephemeral_range=compute_ephemeral_range(hint.cache_control),
             cached_blocks_len_before=cached_blocks_len_before,
             is_prefill=is_prefill,
+            is_cache_hit=False,
         )
 
     def on_block_cache_hit_for_request(self, request: Request, blocks: KVCacheBlocks) -> None:
@@ -177,99 +155,133 @@ class SessionAwareManager:
             f"session_id = {hint.session_id if hint else None}, "
         )
 
-        self._on_blocks_cache_hit(
+        self._register_blocks_to_session(
             session_id=hint.session_id,
-            parent_session_id=hint.parent_session_id,
             blocks=blocks,
             ephemeral_range=compute_ephemeral_range(hint.cache_control),
+            cached_blocks_len_before=None,
+            is_prefill=False,
+            is_cache_hit=True,
         )
 
-    def _on_blocks_allocated(
+    def _register_blocks_to_session(
         self,
-        session_id: str | None,
-        parent_session_id: str | None,
+        session_id: str,
         blocks: KVCacheBlocks,
-        ephemeral_range: EphemeralRange | None = None,
-        cached_blocks_len_before: tuple[int, ...] | None = None,
-        is_prefill: bool = True,
+        ephemeral_range: EphemeralRange | None,
+        cached_blocks_len_before: tuple[int, ...] | None,
+        is_prefill: bool,
+        is_cache_hit: bool,
     ) -> None:
-        """记录本轮刚刚变为完整状态的 cached blocks。"""
+        """allocate / cache-hit 统一注册路径（设计 §4.1）。
 
-        self._ensure_session_registered(session_id, parent_session_id)
+        两个路径都要写 ``block.sessions`` + 填 ``BlockHashState.block_ids_per_group``。
+        state 层的 ref_count / ref_sessions 已由 register_session_block_hash
+        （on_request_scheduled 时 SSM diff 注册）建立，本方法不重复加 ref，
+        只维护 HBM 物理引用与 block meta：
 
+        - allocate（新分配 block，block.block_hash 为本轮新写入）：防御性
+          清理残留引用（正常情况下 block 复用钩子已在 hash 重置前清理过），
+          重置 block session 状态后建立当前 session 引用；
+        - cache hit（prefix cache 命中复用 block）：block 上其他 session 的
+          引用有效，不清理；当前 session 未注册则加引用，已注册则按需
+          刷新 ephemeral TTL（取更晚的过期时间）。
+        """
         now = time.monotonic()
         newly_protected_hashes: list[tuple(int, list[BlockHash])] = []
         newly_protected_ttl: float = 0.0
         protected_block_hashes: list[BlockHash] = []
 
         for group_id, block_ids in enumerate(blocks.get_block_ids()):
-            logger.debug(f"on_blocks_allocated, block_ids={block_ids}")
+            logger.debug(f"register_blocks_to_session, block_ids={block_ids}")
             cached_blocks_len = cached_blocks_len_before[group_id] if cached_blocks_len_before else 0
 
             for ind, block_id in enumerate(block_ids):
                 block = self._get_block(block_id)
 
-                # block本身清理的session_ref_cnt和ttl_expire_at
-                self._reset_block_state(block)
-
-                # 清理TTLManager中这个物理 block 的所有旧 session 引用
-                self._clear_old_block_sessions_ttl(block_id)
-
-                # 清理SAM中这个物理 block 的所有旧 session 引用。
-                self._clear_block_session_refs(block_id)
+                if not is_cache_hit:
+                    # 防御性清理：正常流程中 block 复用钩子（hash 重置前）
+                    # 已清掉旧 session 引用；此处兜底处理绕过钩子的路径。
+                    # 必须在 reset_session_state 之前调用（需要 block_hash
+                    # 反查 _hash_state）。新分配 block 属于活跃请求
+                    # （ref_cnt > 0，不在 free queue），重置安全。
+                    self.clear_block_session_refs(block_id)
+                    self._reset_block_state(block)
 
                 # allocate_slots理论上只传 newly-cached blocks，保留检查用于防御异常情况。
                 if block.block_hash is None:
                     logger.debug("Newly cached block %s has no block hash", block_id)
                     continue
 
-                # SessionBlockRecord所需参数计算
-                is_ephemeral = (
-                    ephemeral_range is not None
-                    and ephemeral_range.ttl > 0
-                    and self.block_size[group_id] // self.hash_block_size * (cached_blocks_len + ind)
-                    <= ephemeral_range.block_offset
-                    and is_prefill
-                )
+                physical_hash = get_block_hash(block.block_hash)
+                state = self._hash_state.get(physical_hash)
 
+                # 填 BlockHashState.block_ids_per_group（两个路径都填；
+                # register 时为全 None，此处填入实际 block_id）
+                if state is not None:
+                    state.add_block_id(group_id, block_id)
+
+                # ephemeral TTL 判定（沿用现有逻辑）
+                if is_cache_hit:
+                    is_ephemeral = (
+                        ephemeral_range is not None
+                        and ephemeral_range.ttl > 0
+                        and self.block_size[group_id] // self.hash_block_size * ind <= ephemeral_range.block_offset
+                    )
+                else:
+                    is_ephemeral = (
+                        ephemeral_range is not None
+                        and ephemeral_range.ttl > 0
+                        and self.block_size[group_id] // self.hash_block_size * (cached_blocks_len + ind)
+                        <= ephemeral_range.block_offset
+                        and is_prefill
+                    )
                 ttl_expire_at = now + ephemeral_range.ttl if is_ephemeral and ephemeral_range is not None else 0.0
 
-                record = SessionBlockRecord(
-                    session_id=session_id,
-                    block_id=block_id,
-                    is_ephemeral=is_ephemeral,
-                    ttl_expire_at=ttl_expire_at,
-                    created_at=now,
-                    block_hash=block.block_hash,
-                )
-                self._add_session_block_ref(record, group_id)
-
-                if is_ephemeral:
-                    newly_protected_hashes.append((block_id, block.block_hash))
-                    newly_protected_ttl = ttl_expire_at
-
-                # get_new_blocks，已经把物理 block 的 session 状态清零。
-                # 使用真实 metadata 做校准，可以兼容异常重复回调：
-                # 两个计数同时校准为 1（新引用建立）。
-                current_ref_count = block.num_session_refs
-                current_session_aware_ref = block.session_aware_ref
-                self._update_block_meta(
-                    block_id,
-                    delta_ref=1 - current_ref_count,
-                    delta_session_aware_ref=1 - current_session_aware_ref,
-                    ttl_expire_at=ttl_expire_at,
-                )
+                if not is_cache_hit:
+                    # 新分配：建立当前 session 引用（block 已在前面
+                    # clear + reset 过，sessions 为空，add 即为唯一引用）
+                    block.sessions.add(session_id)
+                    self._update_block_meta(
+                        block_id,
+                        ttl_expire_at=ttl_expire_at,
+                    )
+                    if is_ephemeral:
+                        newly_protected_hashes.append((block_id, block.block_hash))
+                        newly_protected_ttl = ttl_expire_at
+                else:
+                    # cache hit：是否已注册改为 sid in block.sessions
+                    is_registered = session_id in block.sessions
+                    if not is_registered:
+                        block.sessions.add(session_id)
+                        self._update_block_meta(
+                            block_id,
+                            # None 表示不覆盖其他 session 已经设置的 block TTL。
+                            ttl_expire_at=ttl_expire_at if is_ephemeral else None,
+                        )
+                        if is_ephemeral:
+                            newly_protected_hashes.append((block_id, block.block_hash))
+                            newly_protected_ttl = ttl_expire_at
+                    elif is_ephemeral:
+                        # 已注册则刷新 TTL：block 级取更晚的过期时间。
+                        new_expire_at = max(block.ttl_expire_at, ttl_expire_at)
+                        self._update_block_meta(
+                            block_id,
+                            ttl_expire_at=new_expire_at,
+                        )
+                        newly_protected_hashes.append((block_id, block.block_hash))
+                        newly_protected_ttl = new_expire_at
 
         if ephemeral_range:
             scale_factor = max(self.block_size) // self.hash_block_size
-            session_block_hash = self._session_block_hash.get(session_id)
+            session_states = self._session_hashes.get(session_id, [])
             block_end = (ephemeral_range.block_offset + scale_factor) // scale_factor * scale_factor
-            if ephemeral_range.block_offset + 1 > len(session_block_hash):
+            if ephemeral_range.block_offset + 1 > len(session_states):
                 logger.warning(f"ephemeral range exceed session block hash. session id:{session_id}")
-                block_end = len(session_block_hash)
+                block_end = len(session_states)
 
-            if newly_protected_hashes and session_block_hash:
-                protected_block_hashes = session_block_hash[0:block_end]
+            if newly_protected_hashes and session_states:
+                protected_block_hashes = [s.block_hash for s in session_states[0:block_end]]
 
         self._ttl_manager.register(
             block_infos=newly_protected_hashes,
@@ -278,119 +290,12 @@ class SessionAwareManager:
             protected_block_hashes=protected_block_hashes,
         )
 
-    def _on_blocks_cache_hit(
-        self,
-        session_id: str | None,
-        parent_session_id: str | None,
-        blocks: KVCacheBlocks,
-        ephemeral_range: EphemeralRange | None = None,
-    ) -> None:
-        """prefix cache 命中时通知 SAM"""
-
-        self._ensure_session_registered(session_id, parent_session_id)
-
-        # 最新request的ttl时间
-        now = time.monotonic()
-        newly_protected_hashes: list[tuple(int, list[BlockHash])] = []
-        newly_protected_ttl: float = 0.0
-        protected_block_hashes: list[BlockHash] = []
-
-        for group_id, block_ids in enumerate(blocks.get_block_ids()):
-            for ind, block_id in enumerate(block_ids):
-                # cache hit 的 block 应当已经完整且具有 hash。
-                block = self._get_block(block_id)
-                if block.block_hash is None:
-                    logger.warning("Cache-hit block %s has no block hash; ", block_id)
-                    break
-
-                # 命中后SessionBlockRecord要刷新的参数
-                is_ephemeral = (
-                    ephemeral_range is not None
-                    and ephemeral_range.ttl > 0
-                    and self.block_size[group_id] // self.hash_block_size * ind <= ephemeral_range.block_offset
-                )
-                requested_expire_at = now + ephemeral_range.ttl if is_ephemeral and ephemeral_range is not None else 0.0
-
-                # 检查 session 是否已注册对 block 的引用
-                is_registered = self._is_session_block_registered(session_id, block_id, group_id)
-
-                # 如果已注册，刷新 TTL
-                if is_registered:
-                    record = self._session_blocks[group_id][session_id][block_id]
-
-                    # 刷新TTL, session引用中的刷新为本次的；block本身的刷新为最长的那个
-                    if is_ephemeral:
-                        new_expire_at = max(record.ttl_expire_at, requested_expire_at)
-
-                        record.is_ephemeral = True
-                        record.ttl_expire_at = new_expire_at
-
-                        # 刷新双向索引，确保两边引用同一个最新 record。
-                        self._add_session_block_ref(record, group_id)
-
-                        # self._ttl_manager.update(block_id, session_id, new_expire_at)
-                        newly_protected_hashes.append((block_id, block.block_hash))
-                        newly_protected_ttl = new_expire_at
-
-                        # 一个 block 可能被多个 session 引用，block metadata 应使用
-                        # 所有 session 记录中最晚的过期时间。
-                        block_expire_at = max(
-                            item.ttl_expire_at for item in self._block_sessions[group_id][block_id].values()
-                        )
-                        self._update_block_meta(
-                            block_id,
-                            ttl_expire_at=block_expire_at,
-                        )
-                # 未注册则创建新的引用记录
-                else:
-                    record = SessionBlockRecord(
-                        session_id=session_id,
-                        block_id=block_id,
-                        is_ephemeral=is_ephemeral,
-                        ttl_expire_at=requested_expire_at,
-                        created_at=now,
-                        block_hash=block.block_hash,
-                    )
-                    self._add_session_block_ref(record, group_id)
-
-                    if is_ephemeral:
-                        newly_protected_hashes.append((block_id, block.block_hash))
-                        newly_protected_ttl = requested_expire_at
-
-                        block_expire_at = max(
-                            item.ttl_expire_at for item in self._block_sessions[group_id][block_id].values()
-                        )
-                    else:
-                        # None 表示不覆盖其他 session 已经设置的 block TTL。
-                        block_expire_at = None
-
-                    self._update_block_meta(
-                        block_id,
-                        delta_ref=+1,
-                        delta_session_aware_ref=+1,
-                        ttl_expire_at=block_expire_at,
-                    )
-        if ephemeral_range:
-            scale_factor = max(self.block_size) // self.hash_block_size
-            session_block_hash = self._session_block_hash.get(session_id)
-            block_end = (ephemeral_range.block_offset + scale_factor) // scale_factor * scale_factor
-            if ephemeral_range.block_offset + 1 > len(session_block_hash):
-                logger.warning(f"ephemeral range exceed session block hash. session id:{session_id}")
-                block_end = len(session_block_hash)
-
-            if newly_protected_hashes and session_block_hash:
-                protected_block_hashes = session_block_hash[0:block_end]
-
-        self._ttl_manager.register(
-            newly_protected_hashes, session_id, newly_protected_ttl, protected_block_hashes=protected_block_hashes
-        )
-
     def _on_ttl_expired(self, block_id: int, session_id: str) -> None:
         """ephemeral block TTL 到期回调"""
         logger.debug(f"working on _on_ttl_expired in SAM for block {block_id} and session id {session_id}")
 
         # 统一接口：TTL 到期只清除 block 的 TTL，不动两个引用计数
-        # （session record 仍在，num_session_refs 保持为 _block_sessions
+        # （session 引用仍在，num_session_refs 保持为 block.sessions
         # 的投影）。这会导致 block 的 is_ephemeral() 返回 False，
         # FreeKVCacheBlockQueue.on_block_meta_changed 自动重评估分区，
         # 剩余引用使 block 落入 B 区。
@@ -399,176 +304,84 @@ class SessionAwareManager:
             ttl_expire_at=0.0,
         )
 
-    def _ensure_session_registered(self, session_id: str, parent_session_id: str) -> None:
-        """确保 session 已注册（SAM 内部）"""
-        if session_id not in self._sessions:
-            self._sessions[session_id] = SessionInfo(
-                session_id=session_id,
-                parent_session_id=parent_session_id,
-                created_at=time.monotonic(),
-            )
-            # 如果有父 session，更新父 session 的 children, children不能是自己
-            if parent_session_id and parent_session_id in self._sessions and parent_session_id != session_id:
-                self._sessions[parent_session_id].children.add(session_id)
+    def clear_block_session_refs(self, block_id: int) -> None:
+        """清除指定 block 的所有 session 引用（§7.1：SAM 只改 HBM block + TTL）。
 
-    def _clear_block_session_refs(self, block_id: int) -> None:
-        """清除指定 block 的所有 session 引用（SAM 内部）"""
-        for group_id in range(len(self._block_sessions)):
-            if block_id in self._block_sessions[group_id]:
-                for session_id in list(self._block_sessions[group_id][block_id].keys()):
-                    self._remove_session_block_ref(session_id, block_id, group_id)
+        只清理 block 侧：``block.sessions.clear()`` + 两个计数归零
+        （``set_session_state``）+ 清理各旧 session 在 TTLManager 中对
+        此 block 的 per-block 表项。**不改 state 层**（ref_count /
+        ref_sessions / ``_hash_state`` / ``_session_hashes`` 由 SSM 维护）——
+        被复用 block 上旧 session 的 state 引用由 SSM 既有路径收敛：
+        该 session 下次请求的 register diff（removed 分支减 ref）、
+        显式 evict / LRU 驱逐（classify_evict_work 减 ref）。
 
-    def _add_session_block_ref(self, record: SessionBlockRecord, group_id: int) -> None:
-        """添加 session 对 block 的引用（SAM 内部）"""
-        self._session_blocks[group_id].setdefault(record.session_id, {})[record.block_id] = record
-        self._block_sessions[group_id].setdefault(record.block_id, {})[record.session_id] = record
+        反查 ``_hash_state`` 仅只读（拿 block_ids_per_group 做调试日志），
+        与 §7.1 读路径约定一致。
+        """
+        block = self._get_block(block_id)
+        session_ids = list(block.sessions)
+        if not session_ids:
+            return
 
-    def _is_session_block_registered(self, session_id: str, block_id: int, group_id: int) -> bool:
-        """检查 session 是否已注册对 block 的引用（SAM 内部）"""
-        return session_id in self._session_blocks[group_id] and block_id in self._session_blocks[group_id][session_id]
+        # 只读反查：日志观察当前 hash 维度绑定（不修改 state）
+        if block.block_hash is not None:
+            state = self._hash_state.get(get_block_hash(block.block_hash))
+            if state is not None:
+                logger.debug(
+                    "clear_block_session_refs: block %s currently bound to hash state "
+                    "(block_ids_per_group=%s), %d stale session refs to clear",
+                    block_id, state.block_ids_per_group, len(session_ids),
+                )
 
-    def _remove_session_block_ref(self, session_id: str, block_id: int, group_id: int) -> None:
-        """移除 session 对 block 的引用（SAM 内部）"""
-        if session_id in self._session_blocks[group_id]:
-            self._session_blocks[group_id][session_id].pop(block_id, None)
-            if not self._session_blocks[group_id][session_id]:
-                del self._session_blocks[group_id][session_id]
-        if block_id in self._block_sessions[group_id]:
-            self._block_sessions[group_id][block_id].pop(session_id, None)
-            if not self._block_sessions[group_id][block_id]:
-                del self._block_sessions[group_id][block_id]
+        for session_id in session_ids:
+            # 清理该旧 session 在 TTLManager 中对此 block 的引用
+            self._ttl_manager.remove(block_id, session_id)
 
-    def _free_session(self, session_id: str) -> list:
-        """清理指定 session 的所有 block 引用"""
-        block_hashes = []
-
-        for group_id in range(self.num_kv_cache_groups - 1, -1, -1):
-            block_ids = []
-            if session_id in self._session_blocks[group_id]:
-                for block_id in list(self._session_blocks[group_id][session_id].keys())[::-1]:
-                    cur_block_session = self._block_sessions[group_id].get(block_id, {})
-                    record = cur_block_session.get(session_id)
-                    if record and record.is_ephemeral:
-                        self._ttl_manager.remove(block_id, session_id)
-
-                    self._remove_session_block_ref(session_id, block_id, group_id)
-
-                    remaining_records = self._block_sessions[group_id].get(block_id, {}).values()
-                    latest_ttl_expire_at = max(
-                        (remaining_record.ttl_expire_at for remaining_record in remaining_records),
-                        default=0.0,
-                    )
-
-                    # 显式驱逐：两个计数同时 -1（_free_session 的两个调用方
-                    # —— _free_session_tree（context_management evict）与
-                    # _force_free_session（SSM LRU 驱逐）—— 都是驱逐语义）。
-                    self._update_block_meta(
-                        block_id,
-                        delta_ref=-1,
-                        delta_session_aware_ref=-1,
-                        ttl_expire_at=latest_ttl_expire_at,
-                    )
-
-                    block_ids.append(block_id)
-            logger.info(f"free: session id:{session_id}, group_id:{group_id}, block id:{block_ids}")
-
-        if session_id in self._session_block_hash:
-            block_hashes = self._session_block_hash[session_id]
-            del self._session_block_hash[session_id]
-
-        # 移除 session 注册信息
-        if session_id in self._sessions:
-            parent_session_id = self._sessions[session_id].parent_session_id
-            if parent_session_id and parent_session_id in self._sessions:
-                self._sessions[parent_session_id].children.discard(session_id)
-            del self._sessions[session_id]
-
-        return block_hashes
-
-    def _force_free_session(self, session_id: str) -> list[BlockHash]:
-        """SSM-facing wrapper: free a single session and its session-level TTL."""
-        block_hashes = self._free_session(session_id)
-        self._ttl_manager.remove(block_id=-1, session_id=session_id)
-        return block_hashes
-
-    def _free_session_tree(self, session_id: str) -> list[BlockHash]:
-        """Recursively free a session and all its children."""
-        logger.info("SAM: _free_session_tree [%s]", session_id)
-        session_info = self._sessions.get(session_id)
-        if session_info is None:
-            return []
-
-        all_hashes: list[BlockHash] = []
-        for child_sid in list(self._sessions[session_id].children):
-            all_hashes.extend(self._free_session_tree(child_sid))
-
-        parent_hashes = self._free_session(session_id)
-        all_hashes.extend(parent_hashes)
-
-        logger.debug(
-            f"Free session tree for session {session_id}: "
-            f"total_hashes={len(all_hashes)}, "
-            f"session_info: {self._sessions}, "
+        block.sessions.clear()
+        # 物理引用全部终结（num_session_refs 派生自 sessions，自动归零）
+        self._update_block_meta(
+            block_id,
+            ttl_expire_at=0.0,
         )
 
-        return parent_hashes
-
-    def _execute_offload(
+    def get_session_hash_states_for_range(
         self,
         session_id: str,
         block_start: int,
         block_end: int,
-        block_ids_all_group: tuple[list[int], ...],
-    ) -> int:
-        """卸载指定范围的 block — 减少 session 引用 + 清除当前session的TTL（通知TTLManager）,仅操作 SAM 本地 HBM 数据。"""
-        affected_block_hashes: list[BlockHash] = []
-        update_count = 0
-        for group_id in range(self.num_kv_cache_groups - 1, -1, -1):
-            assert self.block_size[group_id] % self.hash_block_size == 0, (
-                f"block_size {self.block_size[group_id]} is not a multiple of {self.hash_block_size}"
-            )
+    ) -> tuple[list[BlockHashState], int, int]:
+        """expand + 切片 ``_session_hashes[sid]`` 返回 ``list[BlockHashState]``。
 
-            block_ids = block_ids_all_group[group_id]
+        返回 (states, expanded_start, expanded_end)：切片后的 state 列表及
+        扩展后的区间（hash_block_size 粒度、左闭右开）。扩展后的区间供
+        SSM ``classify_evict_work`` 做对应的 trim，保证 trim 范围与物理
+        block 边界对齐（设计 §4.4 / §5）。
+        """
+        states = self._session_hashes.get(session_id)
+        if not states:
+            return [], 0, 0
 
-            for block_id in block_ids[::-1]:
-                cur_block_session = self._block_sessions[group_id].get(block_id, {})
-                record = cur_block_session.get(session_id)
-                if len(cur_block_session) == 0 or record is None:
-                    continue
+        total = len(states)
+        if block_end == -1:
+            block_end = total
+        block_end = min(block_end, total)
 
-                if record.is_ephemeral:
-                    self._ttl_manager.remove(block_id=block_id, session_id=session_id, is_notify_spm=False)
+        if block_start >= block_end:
+            return [], block_start, block_end
 
-                self._remove_session_block_ref(session_id, block_id, group_id)
+        expanded_start, expanded_end = self._expand_session_block_range(session_id, block_start, block_end)
+        return states[expanded_start:expanded_end], expanded_start, expanded_end
 
-                remaining_records = self._block_sessions[group_id].get(block_id, {}).values()
-                latest_ttl_expire_at = max(
-                    (remaining_record.ttl_expire_at for remaining_record in remaining_records),
-                    default=0.0,
-                )
-                # offload 只减少当前引用，不动 session_aware_ref：
-                # block 仍留在 B 区，直到显式 evict 消耗该计数。
-                self._update_block_meta(
-                    block_id,
-                    delta_ref=-1,
-                    ttl_expire_at=latest_ttl_expire_at,
-                )
-                update_count += 1
+    def _on_session_evicted_remote(self, session_id: str, freed_hashes: list[BlockHash]) -> None:
+        """evict 后统一通知 SPM（Controller 路径与 SSM LRU 路径共用）。
 
-        if update_count:
-            block_start_e, block_end_e = self._expand_session_block_range(session_id, block_start, block_end)
-            affected_block_hashes.extend(self._session_block_hash.get(session_id, [])[block_start_e:block_end_e])
-        res = len(affected_block_hashes)
-
-        if _ENABLE_OFFLOAD_TTL_PROTECT:
-            self._ttl_manager.register(
-                block_infos=[],
-                session_id=session_id,
-                expire_at=time.monotonic() + 3600,
-                protected_block_hashes=affected_block_hashes,
-            )
-
-        return res
+        - ``session_blocks_removed``：SPM 侧 SessionKeyTracker 记账清理；
+        - ``context_management_evict``：远端数据实际删除（按 backend 实现）。
+        """
+        if not freed_hashes:
+            return
+        self._notify_event("session_blocks_removed", session_id=session_id, block_hashes=freed_hashes)
+        self._notify_event("context_management_evict", block_hashes=freed_hashes)
 
     def _execute_prefetch(self, session_id: str, block_hashes: list[BlockHash]) -> int:
         """通知 SPM 创建远端预取任务。"""
@@ -579,63 +392,68 @@ class SessionAwareManager:
         )
         return len(block_hashes)
 
-    def _execute_evict(
+    def apply_evict_kvblock(
         self,
         session_id: str,
-        block_start: int,
-        block_end: int,
-        block_ids_all_group: tuple[list[int], ...],
-        is_session: bool,
+        work: list[tuple[BlockHashState, list[int | None]]],
+        is_session_op: bool,
     ) -> list[BlockHash]:
-        """Evict blocks — drop session ref + clear TTL."""
-        if is_session:
-            all_hashes = self._free_session_tree(session_id)
-            self._ttl_manager.remove(block_id=-1, session_id=session_id)
-            return all_hashes
+        """SAM 侧 HBM + TTL apply for evict（设计 §4.4 / §4.5）。
 
-        affected_block_hashes: list[BlockHash] = []
-        for group_id in range(self.num_kv_cache_groups - 1, -1, -1):
-            assert self.block_size[group_id] % self.hash_block_size == 0, (
-                f"block_size {self.block_size[group_id]} is not a multiple of {self.hash_block_size}"
-            )
+        只改 HBM block + TTL：``block.sessions.discard`` /
+        ``set_session_state`` + ``_ttl_manager.remove``。
+        不碰 ref_count / ref_sessions / _hash_state / _session_hashes
+        （这些由 SSM 在 classify_evict_work 中维护）。
 
-            block_ids = block_ids_all_group[group_id]
+        入参 work 为 SSM 分类结果（hbm_only_work + hbm_and_remote_work），
+        每个 entry 为 ``(state, block_ids_per_group 快照)``。SAM 只对
+        ``state.ref_count == 0``（独占 hash）的 state 清空 block 引用并计入
+        freed_hashes；对共享 hash 的 block 仅 discard 当前 sid（block 仍被
+        其他 session 持有，保持其 TTL / 计数不被破坏）。
 
-            for block_id in block_ids[::-1]:
-                cur_block_session = self._block_sessions[group_id].get(block_id, {})
-                record = cur_block_session.get(session_id)
-                if len(cur_block_session) == 0 or record is None:
+        返回 freed_hashes：仅含 ref_count 归 0（无其他 session 共享）的
+        hash，调用方据此通知 SPM 删除远端数据。
+        """
+        freed_hashes: list[BlockHash] = []
+        # 同一物理 block 可能被同一 session 的多个基础 hash 覆盖
+        # （group block_size > hash_block_size），去重保证每个 block 只处理一次。
+        seen_block_ids: set[int] = set()
+
+        for state, block_ids in work:
+            is_exclusive = state.ref_count == 0
+            if is_exclusive:
+                freed_hashes.append(state.block_hash)
+            for bid in block_ids:
+                if bid is None or bid in seen_block_ids:
                     continue
-
-                self._remove_session_block_ref(session_id, block_id, group_id)
-
-                remaining_records = self._block_sessions[group_id].get(block_id, {}).values()
-                latest_ttl_expire_at = max(
-                    (remaining_record.ttl_expire_at for remaining_record in remaining_records),
-                    default=0.0,
-                )
-                # 显式 block-range evict：两个计数同时 -1。record 存在才走到
-                # 这里，重复 evict 时 record 已被移除、直接 continue，保持幂等。
+                seen_block_ids.add(bid)
+                block = self._get_block(bid)
+                if session_id not in block.sessions:
+                    # 该 session 在此 block 上没有物理引用（重复 evict /
+                    # 引用已在 block 复用时清理），幂等跳过
+                    continue
+                block.sessions.discard(session_id)
+                # 逐 block 清理该 session 的 ephemeral TTL 表项，
+                # 防止残留条目到期后误清新使用者的保护
+                self._ttl_manager.remove(bid, session_id)
                 self._update_block_meta(
-                    block_id,
-                    delta_ref=-1,
-                    delta_session_aware_ref=-1,
-                    ttl_expire_at=latest_ttl_expire_at,
+                    bid,
+                    # TTL 仅在 block 上不再有任何 session 引用时清零；
+                    # 还有其他 session 持有时保留（其 ephemeral 保护可能仍在）
+                    ttl_expire_at=0.0 if not block.sessions else None,
                 )
 
-        block_start_e, block_end_e = self._expand_session_block_range(session_id, block_start, block_end)
-        old_hashes = self._session_block_hash.get(session_id, [])
-        affected_block_hashes.extend(old_hashes[block_start_e:block_end_e])
-        # Update shared_dict: drop evicted hashes so the dict stays in sync
-        # with the actual state. SSM reads the updated list through the
-        # shared reference.
-        if old_hashes:
-            self._session_block_hash[session_id] = (
-                old_hashes[:block_start_e] + old_hashes[block_end_e:]
-            )
-
+        # TTL 清理在 SAM 内部做（SAM 负责 TTL）。session-evict 与 range-evict
+        # 均清理该 session 的 hash 维度 TTL 记录（block_id=-1 语义，
+        # 见设计 §4.4 TODO 说明：按整条 session 粒度清理）。
         self._ttl_manager.remove(block_id=-1, session_id=session_id)
-        return affected_block_hashes
+
+        if freed_hashes:
+            logger.info(
+                "SAM: apply_evict_kvblock [%s] is_session_op=%s states=%d freed_hashes=%d blocks=%d",
+                session_id, is_session_op, len(work), len(freed_hashes), len(seen_block_ids),
+            )
+        return freed_hashes
 
     def _get_session_global_block_ids(
         self,
@@ -643,34 +461,28 @@ class SessionAwareManager:
         block_start: int,
         block_end: int,
     ) -> tuple[tuple[list[int], ...], list[BlockHash]]:
-        """将基础 hash block 范围映射为各 KV cache group 的物理 block id。
+        """将基础 hash block 范围映射为各 KV cache group 的物理 block id（设计 §4.7，改写）。
 
-        当某个 KV cache group 的 block size 大于 hash_block_size 时，只要
-        物理 block 与指定逻辑范围有重叠，就返回该物理 block。
+        从 ``_session_hashes[sid]`` 切片 BlockHashState，取
+        ``state.block_ids_per_group``；同一物理 block_id 可能被多个 state
+        共享（group 的 block_size > hash_block_size），per-group 去重保序。
 
-        返回 (per-group block id tuple, hash list)。hash list 按
-        hash_block_size 粒度切片，范围是基于 self.block_size 配置算出的
-        所有 group 实际覆盖范围的并集 [min(start), max(end))（不依赖
-        session_blocks 状态，确保多次 offload 后 session_blocks 已被清空
-        时仍能正确切出 hash list —— offload 不清 shared_dict）。每个 group
-        的切片都是 base_block_hashes 的连续子区间，并集等价于
-        [min(start), max(end))，直接切 base 即保序。block_ids 部分依赖
-        session_blocks，session_blocks 已被清空时 result[group_id] 为空。
+        返回 (per-group block id tuple, union hash list)。
         """
         result: tuple[list[int], ...] = tuple([] for _ in range(self.num_kv_cache_groups))
 
-        base_block_hashes = self._session_block_hash.get(session_id)
-        if not base_block_hashes:
-            logger.warning(f"There is no hash for the session_id:{session_id} in the _session_block_hash.")
+        states = self._session_hashes.get(session_id)
+        if not states:
+            logger.warning(f"There is no hash for the session_id:{session_id} in the _session_hashes.")
             return result, []
 
-        base_block_count = len(base_block_hashes)
-
+        total = len(states)
         if block_end == -1:
-            block_end = base_block_count
+            block_end = total
+        block_end = min(block_end, total)
 
         # 防止负数下标被 Python 当成从末尾索引。
-        if block_start < 0 or block_end < 0:
+        if block_start < 0 or block_end < 0 or block_start >= block_end:
             logger.warning(
                 "Invalid block range for session %s: [%s, %s)",
                 session_id,
@@ -679,104 +491,27 @@ class SessionAwareManager:
             )
             return result, []
 
-        block_end = min(block_end, base_block_count)
+        # —— 用 _expand_session_block_range 扩展边界对齐物理 block ——
+        expanded_start, expanded_end = self._expand_session_block_range(session_id, block_start, block_end)
+        union_states = states[expanded_start:expanded_end]
+        union_hashes = [s.block_hash for s in union_states]
 
-        if block_start >= block_end:
-            return result, []
+        # per-group block_ids（去重，同一物理 block_id 可能被多个 state 共享）
+        for state in union_states:
+            for gid, bid in enumerate(state.block_ids_per_group):
+                if bid is not None and bid not in result[gid]:
+                    result[gid].append(bid)
 
-        union_start = block_end
-        union_end = block_start
-
-        for group_block_size in self.block_size:
-            assert group_block_size % self.hash_block_size == 0, (
-                f"block_size {group_block_size} is not a multiple of {self.hash_block_size}"
-            )
-            scale_factor = group_block_size // self.hash_block_size
-            group_block_start = block_start // scale_factor
-            group_block_end = (block_end + scale_factor - 1) // scale_factor
-            union_start = min(union_start, group_block_start * scale_factor)
-            union_end = max(union_end, group_block_end * scale_factor)
-        if union_start < union_end:
-            longest_hash_list = list(base_block_hashes[union_start:union_end])
-        else:
-            longest_hash_list = []
-
-        for group_id in range(self.num_kv_cache_groups):
-            # 获取该 session_id 第 group_id 的 block_ids(即blocks)
-            session_blocks = self._session_blocks[group_id].get(session_id)
-            # 该group的block_size可能比较大，还没满，继续下一个group
-            if not session_blocks:
-                continue
-
-            group_block_size = self.block_size[group_id]
-            assert group_block_size % self.hash_block_size == 0, (
-                f"block_size {group_block_size} is not a multiple of {self.hash_block_size}"
-            )
-
-            # 将基础 block hash 转换成对应block size的BlockHash
-            scale_factor = group_block_size // self.hash_block_size
-            if scale_factor == 1:
-                group_block_hashes = base_block_hashes
-            else:
-                group_block_hashes = BlockHashListWithBlockSize(
-                    base_block_hashes,
-                    self.hash_block_size,
-                    group_block_size,
-                )
-
-            # 逻辑范围 [block_start, block_end) 与物理 block 有重叠即选中。
-            group_block_start = block_start // scale_factor
-            group_block_end = (block_end + scale_factor - 1) // scale_factor
-            group_block_end = min(group_block_end, len(group_block_hashes))
-
-            if group_block_start >= group_block_end:
-                continue
-
-            # 每个 group 建立 [hash: block_id] 映射
-            hash_block: dict[BlockHash, int] = {}
-
-            for block_id in session_blocks:
-                block_hash_with_group_id = session_blocks[block_id].block_hash
-
-                # 未填满或尚未进入 prefix cache 的 block 可能没有 hash。
-                if block_hash_with_group_id is None:
-                    logger.debug(
-                        "Skip unhashed block %s for session %s, group %s",
-                        block_id,
-                        session_id,
-                        group_id,
-                    )
-                    continue
-
-                physical_hash = get_block_hash(block_hash_with_group_id)
-
-                # 理论上同一 group 的相同完整 hash 应映射到同一缓存内容。
-                # 保留第一次记录，避免覆盖造成结果不稳定。
-                hash_block.setdefault(physical_hash, block_id)
-
-            for group_index in range(group_block_start, group_block_end):
-                target_hash = group_block_hashes[group_index]
-                block_id = hash_block.get(target_hash)
-
-                if block_id is None:
-                    logger.debug(
-                        f"block not found, target block hash:{target_hash}, block index:{group_index * scale_factor}"
-                    )
-                    continue
-
-                result[group_id].append(block_id)
-
-        return result, longest_hash_list
+        return result, union_hashes
 
     def _get_session_block_hash(self, session_id: str, block_start: int, block_end: int) -> list[BlockHash]:
-        if session_id in self._session_block_hash:
-            block_hash_len = len(self._session_block_hash[session_id])
-            assert block_start >= 0 and block_end <= block_hash_len
-            if block_end == -1:
-                block_end = block_hash_len
-            return self._session_block_hash[session_id][block_start:block_end]
-        else:
+        """``_session_hashes[sid]`` 直接取，返回 ``[s.block_hash for s in states[start:end]]``。"""
+        states = self._session_hashes.get(session_id)
+        if not states:
             return []
+        if block_end == -1:
+            block_end = len(states)
+        return [s.block_hash for s in states[block_start:block_end]]
 
     def add_event_listener(self, listener: SessionEventListener):
         """注册事件监听器（SPM 调用）"""
@@ -833,9 +568,15 @@ class SessionAwareManager:
 
     def register_session_block_hash(self, session_id: str, block_hashes: list[BlockHash]) -> None:
         """register session block hash to session aware manager and session state manager.
+
+        SSM 侧做 diff 注册（更新 _hash_state 的 ref_count/ref_sessions 并
+        写入共享的 _session_hashes[sid]）；被移除 hash 的 state 层引用
+        （减 ref / 归零删 entry）也由 SSM diff 完成。block 侧旧引用由
+        block 复用清理路径（clear_block_session_refs）兜底收敛。
+        block_ids_per_group 在 on_blocks_allocated / on_block_cache_hit
+        回调中按物理 block 填入。
         """
         self._session_state_manager.set_session_block_hashes(session_id, block_hashes)
-        self._session_block_hash[session_id] = block_hashes
 
     def _get_block(self, block_id: int) -> KVCacheBlock:
         return self.kv_cache_manager.block_pool.blocks[block_id]
@@ -850,46 +591,21 @@ class SessionAwareManager:
     def _update_block_meta(
         self,
         block_id: int,
-        delta_ref: int = 0,
-        delta_session_aware_ref: int = 0,
         ttl_expire_at: float | None = None,
     ) -> None:
-        """Update Agent Hint metadata and re-evaluate the free queue zone.
+        """Update block TTL metadata and re-evaluate the free queue zone.
 
-        ``delta_ref`` adjusts the current session reference count;
-        ``delta_session_aware_ref`` adjusts the session-aware count that is
-        only consumed by explicit evicts (it replaces the old
-        ``is_offload_block`` flag).  Both are clamped at 0 defensively —
-        an underflow means a double evict/remove, which is logged instead
-        of silently swallowed.
+        session 引用计数不再单独维护：``block.num_session_refs`` 由
+        ``len(block.sessions)`` 实时派生（设计 §7.1 决策），调用方在
+        改完 ``block.sessions`` 后调本方法触发分区重评估；B 区驻留
+        完全由 sessions 非空决定（offload 不动 sessions，替代旧
+        ``is_offload_block`` / 双计数机制）。``ttl_expire_at`` 为 None
+        表示不覆盖现有 TTL。
         """
         block_pool = self.kv_cache_manager.block_pool
         block = block_pool.blocks[block_id]
-        session_ref_cnt = None
-        if delta_ref != 0:
-            new_ref = block.num_session_refs + delta_ref
-            if new_ref < 0:
-                logger.warning(
-                    "_update_block_meta: session ref underflow on block %s "
-                    "(%d + %d), clamping to 0 — possible double evict/remove",
-                    block_id, block.num_session_refs, delta_ref,
-                )
-            session_ref_cnt = max(0, new_ref)
-        session_aware_ref = None
-        if delta_session_aware_ref != 0:
-            new_aware_ref = block.session_aware_ref + delta_session_aware_ref
-            if new_aware_ref < 0:
-                logger.warning(
-                    "_update_block_meta: session_aware_ref underflow on block %s "
-                    "(%d + %d), clamping to 0 — possible double evict",
-                    block_id, block.session_aware_ref, delta_session_aware_ref,
-                )
-            session_aware_ref = max(0, new_aware_ref)
-        block.set_session_state(
-            session_ref_cnt=session_ref_cnt,
-            session_aware_ref=session_aware_ref,
-            ttl_expire_at=ttl_expire_at,
-        )
+        if ttl_expire_at is not None:
+            block.set_session_state(ttl_expire_at=ttl_expire_at)
         if block.ref_cnt == 0 and not block.is_null:
             block_pool.free_block_queue.on_block_meta_changed(block)
 
@@ -899,7 +615,12 @@ class SessionAwareManager:
         block_start: int,
         block_end: int,
     ) -> tuple[int, int]:
-        """扩展左闭右开区间，使其包含所有 group 涉及的完整 block。
+        """扩展左闭右开区间，使其包含所有 group 涉及的完整 block（保留，设计 §8.1）。
+
+        处理 group 的 block_size > hash_block_size 时逻辑范围与物理 block
+        边界对齐的问题：states[start:end] 是 hash_block_size 粒度切片，
+        但物理 block_id 跨多个基础 hash 共享，扩展范围保证切片覆盖完整
+        物理 block。
 
         输入和输出均为 hash_block_size 粒度，区间语义均为
         [block_start, block_end)。
@@ -911,12 +632,12 @@ class SessionAwareManager:
         if block_start == block_end:
             return block_start, block_end
 
-        base_block_hashes = self._session_block_hash.get(session_id)
-        if not base_block_hashes:
-            logger.warning(f"There is no hash for the session_id:{session_id} in the _session_block_hash.")
+        states = self._session_hashes.get(session_id)
+        if not states:
+            logger.warning(f"There is no hash for the session_id:{session_id} in the _session_hashes.")
             return 0, 0
 
-        base_block_count = len(base_block_hashes)
+        base_block_count = len(states)
 
         expanded_start = block_start
         expanded_end = block_end
@@ -938,35 +659,37 @@ class SessionAwareManager:
         expanded_end = min(expanded_end, base_block_count)
         return expanded_start, expanded_end
 
-    def _clear_old_block_sessions_ttl(self, block_id: int) -> None:
-        # 清理TTLManager中这个物理 block 的所有旧 session 引用
-        for group_id in range(len(self._block_sessions)):
-            old_session_ids = list(self._block_sessions[group_id].get(block_id, {}).keys())
-            for old_session_id in old_session_ids:
-                record = self._block_sessions[group_id][block_id].get(old_session_id)
-                if record and record.is_ephemeral:
-                    self._ttl_manager.remove(block_id, old_session_id)
-
     def apply_offload_kvblock(
         self,
-        hbm_work: list[BlockHashState],
-    ) -> None:
-        """SAM 侧 HBM apply for offload (TODO 待实现)."""
-        return
-
-    def apply_evict_kvblock(
-        self,
         session_id: str,
-        work: list[tuple[BlockHashState, list[int]]],
-        is_session_op: bool,
-    ) -> list[BlockHash]:
-        """SAM 侧 HBM + TTL apply for evict (TODO 待实现).
+        hbm_work: list[tuple[BlockHashState, list[int | None]]],
+    ) -> None:
+        """SAM 侧 HBM apply for offload（设计 §4.3，实现说明见 §8.7 决议）。
 
-        Signature matches ``apply_evict_kvblock_fn`` callback expected
-        by SSM. Prefixed with ``_`` because it's bound as a callback
-        (not meant to be called directly by callers other than SSM).
+        offload 不动 ``block.sessions`` / ``ref_cnt`` / ``ref_count``：
+        session 仍逻辑持有 block，只是数据下沉。block 何时真正释放回
+        free queue 仍由 vLLM 原生 ``block.ref_cnt`` 决定；由于
+        ``len(block.sessions) > 0``，block 在 free queue 中自然留在 B 区
+        （``is_offload_block`` 及其后的双计数方案均已由 sessions 集合
+        取代：B 区驻留完全由 sessions 非空派生，无独立标记位）。
+
+        因此 HBM 侧唯一动作是：若启用 ``_ENABLE_OFFLOAD_TTL_PROTECT``，
+        注册 offload TTL 保护（1h hash 维度免疫期）。offload TTL 与
+        ephemeral TTL 独立：前者保护 hash 维度，后者保护 block 维度。
         """
-        return []
+        if not hbm_work:
+            return
+        if _ENABLE_OFFLOAD_TTL_PROTECT:
+            self._ttl_manager.register(
+                block_infos=[],
+                session_id=session_id,
+                expire_at=time.monotonic() + 3600,
+                protected_block_hashes=[state.block_hash for state, _ in hbm_work],
+            )
+        logger.info(
+            "SAM: apply_offload_kvblock [%s] first-offload states=%d (ttl_protect=%s)",
+            session_id, len(hbm_work), _ENABLE_OFFLOAD_TTL_PROTECT,
+        )
 
 
 @dataclass
@@ -1250,74 +973,60 @@ def example_expired_callback(block_id: int, session_id: str) -> None:
 
 
 class SessionController:
-    """Executor for ``context_management.edits``.
+    """Executor for ``context_management.edits`` — 三层编排者（设计 §3.3 / §7.3）。
 
     Processes the ``context_management.edits`` carried by a request,
     executing them immediately or deferring them until the request
-    finishes based on the ``manage_request`` flag. It performs the actual
-    block operations through registered callbacks and is agnostic to the
-    concrete offload/prefetch/evict implementations.
+    finishes based on the ``manage_request`` flag.
 
-    The callbacks come in two categories:
+    Controller 只做编排，不做分类、不改 state、不直接改 block：
+      1. 调 SAM 切片（expand + 切 ``_session_hashes``）拿 ``list[BlockHashState]``；
+      2. 把 states 传给 SSM 分类 + 改 state（ref_count / ref_sessions /
+         offload_count / 增删 _hash_state / trim _session_hashes）；
+      3. 拿 SSM 返回的 work items 分发：HBM work 给 SAM（apply block+TTL），
+         远端 work 给 SPM（通过事件通知）。
 
-    Execute callbacks (registered in ``_execute_sam_callbacks`` /
-    ``_execute_ssm_callbacks``, keyed by edit type and looked up per edit)
+    Callbacks（构造时注册）:
     ----------------------------------------------------------------------
-    SAM-side callbacks (operate on local HBM blocks):
-      ``execute_offload``   (session_id, block_start, block_end, block_ids_all_group) -> int
-      ``execute_prefetch``  (session_id, block_hashes) -> int
-      ``execute_evict``     (session_id, [block_start, block_end, block_ids_all_group,] is_session) -> list[BlockHash]
-                            Returns flat list of evicted hashes. Range evict computes
-                            affected hashes via ``_expand_session_block_range`` internally.
-                            Session evict returns flat list from ``_free_session_tree``
-                            (children + parent). SSM processes all hashes under the single
-                            top-level session_id.
-    SSM-side callbacks (update remote KV pool state):
-      ``ssm_process_offload`` (session_id, block_hashes) -> None
-      ``ssm_process_evict``   (session_id, block_hashes, is_session) -> None
-
-    Query callbacks (stored as attributes, invoked directly)
-    --------------------------------------------------------
-    ``get_block_hashes_by_session``  (session_id, block_start, block_end) -> list[BlockHash]
-    ``get_global_block_id_by_session`` (session_id, block_start, block_end) -> tuple[tuple[list[int], ...], list[BlockHash]]
-        Returns (per-group block ids, longest hash list at hash_block_size
-        granularity). The hash list is forwarded to SAM callbacks and SSM
-        so all three see the same hash — avoids the previous mismatch where
-        SAM sliced shared_dict itself and could include hashes for unhashed
-        blocks that ``block_ids_all_group`` skipped.
-
-    Note:
-      - Blocks/indices are NOT resolved here; each SAM callback resolves the
-        logical range into physical blocks through the query callbacks.
-      - ``prefetch`` is resolved via ``get_block_hashes_by_session`` and
-        forwards the block hashes to the SPM; other edit types resolve via
-        ``get_global_block_id_by_session`` and hand over
-        ``(block_start, block_end, physical block ids, hash list, is_session)``.
+    SAM-side:
+      ``get_hash_states_for_range``  (session_id, block_start, block_end)
+          -> (list[BlockHashState], expanded_start, expanded_end)
+      ``execute_prefetch``           (session_id, block_hashes) -> int
+      ``apply_offload_kvblock``      (session_id, hbm_work) -> None
+      ``apply_evict_kvblock``        (session_id, work, is_session_op) -> list[BlockHash]
+          返回 freed_hashes（ref_count 归 0 的独占 hash），Controller 据此
+          通知 SPM 删除远端数据。
+    SSM-side:
+      ``ssm_classify_offload``  (session_id, states) -> OffloadWork dict
+      ``ssm_classify_evict``    (session_id, states, is_session_op, start, end) -> EvictWork dict
+    Query:
+      ``get_block_hashes_by_session`` (session_id, block_start, block_end) -> list[BlockHash]
+          用于 block 范围合法性校验（total length）与 prefetch hash 解析。
+    Event:
+      ``spm_notify`` (event_type, **kwargs) -> None
+          SAM 的事件分发入口（监听者为 SPM），用于 offload / evict 的远端动作。
     """
 
     def __init__(
         self,
         *,
-        execute_offload: Callable[..., int],
-        execute_prefetch: Callable[..., int],
-        execute_evict: Callable[..., list[BlockHash]],
-        get_global_block_id_by_session: Callable[[str, int, int], tuple[tuple[list[int], ...], list[BlockHash]]],
+        get_hash_states_for_range: Callable[..., tuple[list[BlockHashState], int, int]],
         get_block_hashes_by_session: Callable[[str, int, int], list[BlockHash]],
-        ssm_process_offload=Callable[..., None],
-        ssm_process_evict=Callable[..., None],
-
+        execute_prefetch: Callable[..., int],
+        apply_offload_kvblock: Callable[..., None],
+        apply_evict_kvblock: Callable[..., list[BlockHash]],
+        ssm_classify_offload: Callable[..., dict],
+        ssm_classify_evict: Callable[..., dict],
+        spm_notify: Callable[..., None],
     ):
-        self._execute_sam_callbacks: dict[str, Callable[..., Any]] = {
-            "offload": execute_offload,
-            "prefetch": execute_prefetch,
-            "evict": execute_evict,
-        }
-        self._execute_ssm_callbacks: dict[str, Callable[..., None]] = {
-            "offload": ssm_process_offload,
-            "evict": ssm_process_evict,
-        }
-        self._get_global_block_id_by_session = get_global_block_id_by_session
+        self._get_hash_states_for_range = get_hash_states_for_range
         self._get_block_hashes_by_session = get_block_hashes_by_session
+        self._execute_prefetch = execute_prefetch
+        self._apply_offload_kvblock = apply_offload_kvblock
+        self._apply_evict_kvblock = apply_evict_kvblock
+        self._ssm_classify_offload = ssm_classify_offload
+        self._ssm_classify_evict = ssm_classify_evict
+        self._spm_notify = spm_notify
 
         # request_id → [(edit, session_id), ...]
         self._pending_edits: dict[str, list[tuple[ContextManagementEditsParams, str]]] = {}
@@ -1422,7 +1131,7 @@ class SessionController:
         edit: ContextManagementEditsParams,
         session_id: str,
     ) -> EditResponse:
-        """执行单个 edit，通过注册的回调执行实际操作。"""
+        """执行单个 edit — 三层编排：SAM 切片 → SSM 分类+改 state → SAM apply + SPM 远端。"""
         # block_start / block_end 由 pymotor 从 message index 转换而来
         # 返回格式：EditResponse,记录op操作，session id，状态及详细信息
         if edit.target != "session" and (edit.block_start is None or edit.block_end is None):
@@ -1439,9 +1148,8 @@ class SessionController:
             f"(block_start={edit.block_start}, block_end={edit.block_end})."
         )
 
-        sam_fn = self._execute_sam_callbacks.get(edit.type)
-        if sam_fn is None:
-            logger.warning("No callback registered for edit type: %s, skipping.", edit.type)
+        if edit.type not in ("offload", "prefetch", "evict"):
+            logger.warning("Unsupported edit type: %s, skipping.", edit.type)
             return EditResponse(
                 session_id=session_id, type=edit.type, op_status=False, fail_reason=f"invalid edit type {edit.type}"
             )
@@ -1451,48 +1159,53 @@ class SessionController:
         fail_reason = ""
         is_session_op = edit.target == "session"
 
-        # TODO: 获取当前session 基础hash总长度
+        # 获取当前 session 基础 hash 总长度
         total_block_length = len(self._get_block_hashes_by_session(session_id, 0, -1))
-        logger.info(f"Process session {session_id} with block hash lengh {total_block_length}")
+        logger.info(f"Process session {session_id} with block hash length {total_block_length}")
         op_result, fail_reason = self.process_edit_index(edit, total_block_length, session_id)
 
         if op_result:
-            hashes_for_ssm: list[BlockHash] | None = None
-
             if edit.type == "prefetch":
-                block_hashes_for_sam = self._get_block_hashes_by_session(
+                # prefetch：无分类、无 state 改动，解析 hash 后直接通知 SPM
+                block_hashes_for_spm = self._get_block_hashes_by_session(
                     session_id, edit.block_start, edit.block_end)
-                actual_process_blocks = sam_fn(session_id, block_hashes_for_sam)
+                actual_process_blocks = self._execute_prefetch(session_id, block_hashes_for_spm)
             else:
-                # evict / offload: resolve global block ids + union hash list,
-                # 透传给 SAM 回调。evict 把 is_session_op 一并透传，SAM 内
-                # 部根据该 flag 走 _free_session_tree 或 range 分支；offload
-                # 不需要该 flag。
-                process_session_block_info, block_hashes = self._get_global_block_id_by_session(
+                # 1. SAM 切片：expand + 切 _session_hashes 拿 list[BlockHashState]
+                #    （返回扩展后的区间，供 SSM trim 对齐物理 block 边界）
+                states, expanded_start, expanded_end = self._get_hash_states_for_range(
                     session_id, edit.block_start, edit.block_end)
-                process_num = sum(len(info) for info in process_session_block_info)
-                logger.info(f"session {session_id} block id count {process_num}")
 
-                if edit.type == "evict":
-                    evicted_hashes = sam_fn(
-                        session_id, edit.block_start, edit.block_end,
-                        process_session_block_info, is_session_op)
-                    actual_process_blocks = len(evicted_hashes)
-                    hashes_for_ssm = evicted_hashes
-                else:  # offload
-                    actual_process_blocks = sam_fn(
-                        session_id, edit.block_start, edit.block_end,
-                        process_session_block_info)
-                    hashes_for_ssm = block_hashes
-
-                ssm_fn = self._execute_ssm_callbacks.get(edit.type)
-                if ssm_fn is not None:
-                    #TODO: 传入根据边界切割后的state list
-                    states_for_ssm = [
-                        st for h in hashes_for_ssm
-                        if (st := self._session_state_manager._hash_state.get(h)) is not None
-                    ]
-                    ssm_fn(session_id, states_for_ssm)
+                if edit.type == "offload":
+                    # 2. SSM 分类 + 改 state（active-share 过滤 + 推进 offload_count）
+                    work = self._ssm_classify_offload(session_id, states)
+                    # 3. Controller 分发：HBM work 给 SAM，远端 work 给 SPM
+                    self._apply_offload_kvblock(session_id, work["hbm_work"])
+                    if work["remote_work"]:
+                        self._spm_notify("context_management_offload", block_hashes=work["remote_work"])
+                    actual_process_blocks = len(states) - len(work["skipped"])
+                else:  # evict（range evict / session evict 走同一三层流程）
+                    # 2. SSM 分类 + 改 state（减 ref / del entry / trim 或 pop
+                    #    _session_hashes，内部含 LRU 维护）
+                    work = self._ssm_classify_evict(
+                        session_id, states, is_session_op, expanded_start, expanded_end)
+                    # 3. Controller 分发：SAM apply block+TTL；freed_hashes
+                    #    （独占 hash）通知 SPM 删远端
+                    freed_hashes = self._apply_evict_kvblock(
+                        session_id,
+                        work["hbm_only_work"] + work["hbm_and_remote_work"],
+                        is_session_op,
+                    )
+                    if freed_hashes:
+                        self._spm_notify(
+                            "session_blocks_removed",
+                            session_id=session_id,
+                            block_hashes=freed_hashes,
+                        )
+                        self._spm_notify("context_management_evict", block_hashes=freed_hashes)
+                    # 实际处理数 = 分类处理过的 state（含共享减 ref），
+                    # skipped 不计；独占释放数另见 freed_hashes
+                    actual_process_blocks = len(states) - len(work["skipped"])
 
         return EditResponse(
             session_id=session_id,
@@ -1564,20 +1277,21 @@ class BlockHashState:
     - 2: sunk to bottom, reached the cap, cannot offload further (entering
       this phase triggers SPM notification to release remote data)
 
-    ``block_ids_per_group`` lists the physical block ids that currently
-    hold this hash across all KV cache groups. SSM itself does not consume
-    this field for ref/offload bookkeeping; it is metadata for upstream
-    layers (SAM/SPM) to locate the concrete blocks when an offload/evict
-    is materialized. Maintained by SAM on alloc/cache-hit/free.
+    ``block_ids_per_group``: index = group_id, value = 物理 block_id；
+    None 表示该 group 还没有对应的物理 block（hash 未填满该 group 的
+    block）。同一物理 block_id 可能被多个 BlockHashState 共享（group 的
+    block_size > hash_block_size 时，一个物理 block 覆盖多个基础 hash）。
+    register 时初始化为全 None，由 SAM 在 allocate / cache-hit 回调中
+    填入；SSM 在 classify 时快照并清空。SSM 不消费此字段做 ref/offload
+    记账，仅供 SAM/SPM 定位物理 block。
     """
     block_hash: BlockHash
     ref_count: int = 0
     ref_sessions: set[str] = field(default_factory=set)
     offload_count: int = 0
     max_offload_count: int = 2
-    # Physical block ids holding this hash across all groups. Duplicates
-    # are ignored; removal is by value.
-    block_ids_per_group: list[int] = field(default_factory=list)
+    # index = group_id, value = physical block_id (None = not materialized)
+    block_ids_per_group: list[int | None] = field(default_factory=list)
 
     def add_ref(self, session_id: str) -> bool:
         """Add a session reference. Returns whether offload_count was reset."""
@@ -1618,33 +1332,40 @@ class BlockHashState:
         other_sessions = self.ref_sessions - {requesting_session}
         return any(is_active_fn(sid) for sid in other_sessions)
 
-    def add_block_id(self, block_id: int) -> None:
-        """Register a physical block holding this hash.
+    def add_block_id(self, group_id: int, block_id: int) -> None:
+        """Register the physical block holding this hash in ``group_id``.
 
-        Idempotent: duplicate calls with the same block_id do not append
-        a second entry. SAM calls this on alloc / cache-hit once the
-        block↔hash mapping is established.
+        Grows the list with ``None`` placeholders up to ``group_id`` first
+        (register 时为空列表). Idempotent per group: the (hash, group)
+        pair maps to exactly one cached block, repeated calls just
+        overwrite with the same value. SAM calls this on alloc /
+        cache-hit once the block↔hash mapping is established.
         """
-        if block_id not in self.block_ids_per_group:
-            self.block_ids_per_group.append(block_id)
+        if group_id >= len(self.block_ids_per_group):
+            self.block_ids_per_group.extend([None] * (group_id + 1 - len(self.block_ids_per_group)))
+        self.block_ids_per_group[group_id] = block_id
 
     def remove_block_id(self, block_id: int) -> bool:
-        """Unregister a physical block.
+        """Unregister a physical block (by value, across all groups).
 
-        Returns True if the block was present and removed; False if it
-        was not found (no-op, logged at debug level — happens on
-        duplicate free or when the hash was never materialized in that
-        block).
+        Returns True if the block was present and cleared; False if it
+        was not found (no-op — happens on duplicate free or when the hash
+        was never materialized in any block).
         """
-        try:
-            self.block_ids_per_group.remove(block_id)
-            return True
-        except ValueError:
-            logger.warning(
-                "BlockHashState.remove_block_id: block %s not found for hash %s",
-                block_id, self.block_hash,
-            )
-            return False
+        found = False
+        for gid, bid in enumerate(self.block_ids_per_group):
+            if bid == block_id:
+                self.block_ids_per_group[gid] = None
+                found = True
+        return found
+
+    def snapshot_block_ids(self) -> list[int | None]:
+        """Copy of ``block_ids_per_group`` (SSM classify 时快照用)."""
+        return list(self.block_ids_per_group)
+
+    def clear_block_ids(self) -> None:
+        """Clear all physical block bindings, keeping per-group shape."""
+        self.block_ids_per_group = [None] * len(self.block_ids_per_group)
 
 
 class SessionLRU:
@@ -1735,8 +1456,8 @@ class SessionStateManager:
         max_sessions: int = 1000,
         session_hash_state: dict[str, list[BlockHashState]] | None = None,
         hash_state: dict[BlockHash, BlockHashState] | None = None,
-        apply_evict_remote_cache_fn: Callable[[list[BlockHash]], int | None] | None = None,
-        apply_evict_kvblock_fn: Callable[[str, list[tuple[BlockHashState, list[int]]], bool], list[BlockHash]] | None = None,
+        apply_evict_remote_cache_fn: Callable[[str, list[BlockHash]], int | None] | None = None,
+        apply_evict_kvblock_fn: Callable[[str, list[tuple[BlockHashState, list[int | None]]], bool], list[BlockHash]] | None = None,
     ):
         self._session_hash_state: dict[str, list[BlockHashState]] = (
             session_hash_state if session_hash_state is not None else {}
@@ -1770,15 +1491,20 @@ class SessionStateManager:
     def set_session_block_hashes(
         self, session_id: str, new_hashes: list[BlockHash],
     ) -> None:
-        """Diff-register hashes: update BlockHashState ref_count/ref_sessions.
+        """Diff-register hashes: update BlockHashState ref_count/ref_sessions
+        and rewrite the shared ``_session_hash_state[session_id]`` list.
 
         Diff strategy (only handle added/removed, leave common alone):
           - removed (old - new): decrement ref_count; if 0, del _hash_state.
           - added   (new - old): create state or add_ref (resets offload_count).
           - common  (old & new): untouched — avoids resetting offload_count
             of a long-held hash or triggering state delete-then-recreate.
+
+        调用时点：scheduler 在 on_request_scheduled 中对本轮请求的全部
+        hash 调用（先于 allocate/cache-hit 回调），因此
+        ``BlockHashState.block_ids_per_group`` 此时尚未填充（全 None），
+        由 SAM 在后续回调中填入实际 block_id。
         """
-        # TODO:确认sam调用的时间点及_session_hash_state的更新，目前接口暂未更新_session_hash_state
         old_states = self._session_hash_state.get(session_id, [])
         old_hashes = {s.block_hash for s in old_states}
         new_set = set(new_hashes)
@@ -1790,22 +1516,36 @@ class SessionStateManager:
                          session_id, len(old_states), len(new_hashes), len(added), len(removed))
 
         for state in removed:
+            # removed：仅 state 层减 ref / 归零删 entry（SSM 是 state 权威）。
+            # block 侧旧引用不在此处理 —— 由 block 复用清理路径
+            # （SAM.clear_block_session_refs）兜底收敛。
             if state.remove_ref(session_id):
                 del self._hash_state[state.block_hash]
 
         new_count = 0
         reset_count = 0
-        for h in added:
+        new_state_list: list[BlockHashState] = []
+        for h in new_hashes:
             state = self._hash_state.get(h)
-            if state is not None:
+            if h in old_hashes:
+                # common：沿用旧 state 对象（同一份引用，block_ids 保留）
+                assert state is not None
+            elif state is not None:
+                # added 且全局已存在（其他 session 引用过）：add_ref
                 if state.add_ref(session_id):
                     reset_count += 1
             else:
-                self._hash_state[h] = BlockHashState(
+                state = BlockHashState(
                     block_hash=h, ref_count=1, ref_sessions={session_id},
                     offload_count=0,
                 )
+                self._hash_state[h] = state
                 new_count += 1
+            new_state_list.append(state)
+
+        # SAM 侧写 _session_hashes：SSM 是共享表的权威维护者（设计 §3.1），
+        # list 保序 = hash_block_size 粒度的位置顺序。
+        self._session_hash_state[session_id] = new_state_list
 
         logger.info("SSM: set_session_block_hashes [%s] %d new global entries, %d reset to HBM, total managed hashes=%d",
                       session_id, new_count, reset_count, len(self._hash_state))
@@ -1823,8 +1563,8 @@ class SessionStateManager:
         """Classify states for offload + advance offload_count at classify time.
 
         State attributes are updated here (SSM owns them): ``offload_count``
-        is advanced via ``offload_once()``, and ``block_ids_per_group`` is
-        cleared after the offload action (HBM no longer holds these blocks).
+        is advanced via ``offload_once()`. ``block_ids_per_group`` 仅做快照
+        不清空 —— offload 不动 block.sessions，HBM 物理绑定仍然有效。
 
         Returns OffloadWork dict:
           - ``hbm_work``:   [(state, block_ids_per_group_snapshot) for state in first_offload_states]
@@ -1834,7 +1574,7 @@ class SessionStateManager:
           - ``skipped``:    [state for state in active_shared_or_max_reached]
                             no change
         """
-        hbm_work: list[tuple[BlockHashState, list[int]]] = []
+        hbm_work: list[tuple[BlockHashState, list[int | None]]] = []
         remote_work: list[BlockHash] = []
         skipped: list[BlockHashState] = []
         for state in states:
@@ -1845,9 +1585,11 @@ class SessionStateManager:
                 skipped.append(state)
                 continue
             reached_bottom = state.offload_once()
-            # offload 后 HBM 不再持有这些 block，清空 state.block_ids_per_group
-            block_ids_snapshot = list(state.block_ids_per_group)
-            state.block_ids_per_group = []
+            # 仅快照、不清空 block_ids_per_group：offload 不动 block.sessions
+            # （session 仍逻辑持有 block，HBM 物理绑定仍然有效），后续 evict
+            # 仍需通过绑定定位 block 清理引用。apply_offload_kvblock 只消费
+            # hash（TTL 保护注册），不依赖 block 快照。
+            block_ids_snapshot = state.snapshot_block_ids()
             if reached_bottom:
                 remote_work.append(state.block_hash)
             else:
@@ -1866,7 +1608,10 @@ class SessionStateManager:
         self,
         session_id: str,
         states: list[BlockHashState],
-    ) -> dict[str, list[tuple[BlockHashState, list[int]]]]:
+        is_session_op: bool | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> dict[str, list[tuple[BlockHashState, list[int | None]]]]:
         """Classify states for evict + mutate state at classify time.
 
         Returns EvictWork dict:
@@ -1879,9 +1624,15 @@ class SessionStateManager:
           Each work entry is ``(state, block_ids_snapshot)`` — snapshot
           taken before the block list is cleared, so callers can still
           locate the concrete HBM blocks to release.
+
+        ``is_session_op`` / ``start`` / ``end``：由调用方（Controller）传入
+        SAM 切片时返回的扩展区间，SSM 据此 trim ``_session_hash_state[sid]``
+        （range evict 按 [start, end) 切片剔除）或 pop 整条（session evict，
+        同时清 LRU 条目）。未显式传入时退回按覆盖长度推断（LRU 驱逐传整条
+        session states，等价 session op）。
         """
-        hbm_only_work: list[tuple[BlockHashState, list[int]]] = []
-        hbm_and_remote_work: list[tuple[BlockHashState, list[int]]] = []
+        hbm_only_work: list[tuple[BlockHashState, list[int | None]]] = []
+        hbm_and_remote_work: list[tuple[BlockHashState, list[int | None]]] = []
         skipped: list[BlockHashState] = []
         for state in states:
             if state.is_shared_with_active_session(session_id, self._is_session_active):
@@ -1889,27 +1640,56 @@ class SessionStateManager:
                 continue
             state.ref_sessions.discard(session_id)
             state.ref_count = max(0, state.ref_count - 1)
-            block_ids_snapshot = list(state.block_ids_per_group)
-            # 无 active 共享即可清空 block 归属（与 offload 一致），
-            # 不必等 ref_count == 0。
-            state.block_ids_per_group = []
+            block_ids_snapshot = state.snapshot_block_ids()
             if state.ref_count == 0:
+                # 独占 hash：state 即将删除，绑定一并清空
+                state.clear_block_ids()
                 del self._hash_state[state.block_hash]
                 hbm_and_remote_work.append((state, block_ids_snapshot))
             else:
+                # 共享 hash：保留 block_ids_per_group 绑定 —— block 仍被
+                # 其他 session 持有，最后一个 session 驱逐时（ref 归 0）
+                # SAM 仍需通过绑定定位 block 清理引用
                 hbm_only_work.append((state, block_ids_snapshot))
 
         # SSM bookkeeping on _session_hash_state + LRU.
-        # is_session_op: states 覆盖了该 session 全部 state → 整 session evict。
-        session_states = self._session_hash_state.get(session_id, [])
-        is_session_op = len(states) >= len(session_states)
+        # skipped（active-share 保护）的 state 保留在 session 列表中：
+        # 其 ref_count/ref_sessions 未变（sid 仍引用该 hash），若从列表
+        # 摘除会导致该引用永不释放（ref 永不归 0 的僵尸条目）。
+        skipped_ids = {id(s) for s in skipped}
+        if is_session_op is None:
+            session_states = self._session_hash_state.get(session_id, [])
+            is_session_op = len(states) >= len(session_states)
         if is_session_op:
-            self._session_hash_state.pop(session_id, None)
-            self._lru.remove(session_id)
+            if skipped_ids:
+                # 部分 state 被 active-share 保护：仅移除非 skipped 的，
+                # session 仍持有这些 hash（后续可重试 evict）
+                remaining_states = [s for s in states if id(s) in skipped_ids]
+                self._session_hash_state[session_id] = remaining_states
+                self._lru.touch(session_id)
+                self._lru.set_hash_count(session_id, len(remaining_states))
+            else:
+                # session evict: pop 整条 + 清 LRU 条目
+                self._session_hash_state.pop(session_id, None)
+                self._lru.remove(session_id)
+        elif start is not None and end is not None:
+            # range evict: 按 SAM 返回的扩展区间 [start, end) 切片剔除
+            # （排除 skipped），保证 trim 范围与物理 block 边界对齐
+            old = self._session_hash_state.get(session_id)
+            if old is not None:
+                self._session_hash_state[session_id] = (
+                    old[:start]
+                    + [s for s in old[start:end] if id(s) in skipped_ids]
+                    + old[end:]
+                )
+            remaining = self._session_hash_state.get(session_id)
+            if remaining:
+                self._lru.touch(session_id)
+                self._lru.set_hash_count(session_id, len(remaining))
         else:
-            # range evict: 从 _session_hash_state[sid] 里剔除本轮 evict 的 state。
-            # 用 block_hash 集合做差集，避免残留已被 del _hash_state 的僵尸引用。
-            evicted_hashes = {s.block_hash for s in states}
+            # 防御路径（未传区间）：用 block_hash 集合做差集（排除
+            # skipped），避免残留已被 del _hash_state 的僵尸引用。
+            evicted_hashes = {s.block_hash for s in states if id(s) not in skipped_ids}
             old = self._session_hash_state.get(session_id)
             if old is not None:
                 self._session_hash_state[session_id] = [
@@ -1968,11 +1748,16 @@ class SessionStateManager:
             # 1. slice states (whole session)
             states = self._session_hash_state.get(sid, [])
             if not states:
+                # 空 session（短请求未满一个 hash block）：pop 残留的空列表
+                # 键 + 清 LRU 条目
+                self._session_hash_state.pop(sid, None)
                 self._lru.remove(sid)
                 continue
 
             # 2. classify + mutate state (pop _session_hash_state + remove LRU inside)
-            evict_work = self.classify_evict_work(sid, states)
+            #    LRU 驱逐是 session-evict 的特例（SSM 触发，无 Controller 介入），
+            #    显式传 is_session_op=True
+            evict_work = self.classify_evict_work(sid, states, is_session_op=True)
             hbm_only_work = evict_work["hbm_only_work"]
             hbm_and_remote_work = evict_work["hbm_and_remote_work"]
 
@@ -1985,7 +1770,7 @@ class SessionStateManager:
 
             # 4. notify SPM (freed = exclusive hashes, safe to delete remote)
             if self._apply_evict_remote_cache_fn is not None and freed_hashes:
-                self._apply_evict_remote_cache_fn(freed_hashes)
+                self._apply_evict_remote_cache_fn(sid, freed_hashes)
 
             logger.info(
                 "SSM: _try_evict_if_needed [%s] done — states=%d hbm_only=%d "
