@@ -632,7 +632,7 @@ class SessionAwareManager:
 
     def process_prefetch_req(self, num_unfinished_requests: int) -> None:
         """统一 prefetch 入口：调 SPM 处理预取，然后更新 SSM hash 位置为 HBM。"""
-        logger.info(
+        logger.debug(
             "SAM: process_prefetch_req enter unfinished=%d listeners=%d",
             num_unfinished_requests, len(self._event_listeners),
         )
@@ -640,10 +640,17 @@ class SessionAwareManager:
             handler = getattr(listener, "process_prefetch_req", None)
             if handler is not None:
                 results = handler(num_unfinished_requests)
-                logger.info(
-                    "SAM: process_prefetch_req listener=%r returned %d prefetch results",
-                    listener, len(results) if results else 0,
-                )
+                n_results = len(results) if results else 0
+                if n_results > 0:
+                    logger.info(
+                        "SAM: process_prefetch_req listener=%r returned %d prefetch results",
+                        listener, n_results,
+                    )
+                else:
+                    logger.debug(
+                        "SAM: process_prefetch_req listener=%r returned 0 prefetch results (no-op)",
+                        listener,
+                    )
                 for session_id, block_hashes in results:
                     self._session_state_manager.process_prefetch_hashes(session_id, block_hashes)
                 break
@@ -687,8 +694,13 @@ class SessionAwareManager:
 
     def tick(self, now: float | None = None) -> None:
         """推进 TTL timer wheel，并在 LRU 满时尝试淘汰 session。由 scheduler 统一调用。"""
-        logger.info("SAM: tick enter now=%s", now)
+        logger.debug("SAM: tick enter now=%s", now)
+        expired_before = len(self._ttl_manager._entries)
         self._ttl_manager.tick(now)
+        expired_after = len(self._ttl_manager._entries)
+        if expired_before != expired_after:
+            logger.info("SAM: tick expired %d TTL entries (now=%s)",
+                        expired_before - expired_after, now)
         self._session_state_manager._try_evict_if_needed()
 
     def register_agent_hint(
