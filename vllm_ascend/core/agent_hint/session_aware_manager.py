@@ -90,7 +90,7 @@ class SessionAwareManager:
         self._event_listeners: list[SessionEventListener] = []
 
         self._session_state_manager = SessionStateManager(
-            max_sessions=10,
+            max_sessions=100,
             session_hash_state=self._session_hashes,
             hash_state=self._hash_state,
             apply_evict_remote_cache_fn=self._on_session_evicted_remote,
@@ -284,7 +284,7 @@ class SessionAwareManager:
                 protected_block_hashes = [s.block_hash for s in session_states[0:block_end]]
 
         self._ttl_manager.register(
-            block_infos=newly_protected_hashes,
+            block_infos=[],
             session_id=session_id,
             expire_at=newly_protected_ttl,
             protected_block_hashes=protected_block_hashes,
@@ -332,10 +332,6 @@ class SessionAwareManager:
                     "(block_ids_per_group=%s), %d stale session refs to clear",
                     block_id, state.block_ids_per_group, len(session_ids),
                 )
-
-        for session_id in session_ids:
-            # 清理该旧 session 在 TTLManager 中对此 block 的引用
-            self._ttl_manager.remove(block_id, session_id)
 
         block.sessions.clear()
         # 物理引用全部终结（num_session_refs 派生自 sessions，自动归零）
@@ -435,7 +431,6 @@ class SessionAwareManager:
                 block.sessions.discard(session_id)
                 # 逐 block 清理该 session 的 ephemeral TTL 表项，
                 # 防止残留条目到期后误清新使用者的保护
-                self._ttl_manager.remove(bid, session_id)
                 self._update_block_meta(
                     bid,
                     # TTL 仅在 block 上不再有任何 session 引用时清零；
@@ -931,7 +926,7 @@ class TTLManager:
 
         同时从 ``_entries`` 和 timer wheel 中删除。如果不存在则静默忽略。
         """
-        block_id = block_id if block_id > 0 else 0
+        block_id = block_id
         key = (block_id, session_id)
         if key in self._entries:
             entry = self._entries.pop(key)
@@ -1459,6 +1454,15 @@ class SessionStateManager:
         apply_evict_remote_cache_fn: Callable[[str, list[BlockHash]], int | None] | None = None,
         apply_evict_kvblock_fn: Callable[[str, list[tuple[BlockHashState, list[int | None]]], bool], list[BlockHash]] | None = None,
     ):
+        logger.info(
+            "SSM: __init__ max_sessions=%d shared_session_hash_state=%s shared_hash_state=%s "
+            "has_evict_remote_cb=%s has_evict_kvblock_cb=%s",
+            max_sessions,
+            session_hash_state is not None,
+            hash_state is not None,
+            apply_evict_remote_cache_fn is not None,
+            apply_evict_kvblock_fn is not None,
+        )
         self._session_hash_state: dict[str, list[BlockHashState]] = (
             session_hash_state if session_hash_state is not None else {}
         )
@@ -1470,23 +1474,37 @@ class SessionStateManager:
 
         self._apply_evict_remote_cache_fn = apply_evict_remote_cache_fn
         self._apply_evict_kvblock_fn = apply_evict_kvblock_fn
+        logger.debug(
+            "SSM: __init__ done active_session_ids=%s lru_len=%d total_hash_state=%d",
+            self._active_session_ids,
+            len(self._lru),
+            len(self._hash_state),
+        )
 
     # ════════════════════════════════════════════════════════════════
     # Active session tracking
     # ════════════════════════════════════════════════════════════════
 
     def mark_session_active(self, session_id: str) -> None:
+        logger.debug("SSM: mark_session_active enter [%s] current_active=%s", session_id, self._active_session_ids)
         if session_id not in self._active_session_ids:
             logger.info("SSM: mark_session_active [%s]", session_id)
             self._active_session_ids.add(session_id)
+        else:
+            logger.debug("SSM: mark_session_active [%s] already active, no-op", session_id)
 
     def mark_session_inactive(self, session_id: str) -> None:
+        logger.debug("SSM: mark_session_inactive enter [%s] current_active=%s", session_id, self._active_session_ids)
         if session_id in self._active_session_ids:
             logger.info("SSM: mark_session_inactive [%s]", session_id)
             self._active_session_ids.discard(session_id)
+        else:
+            logger.debug("SSM: mark_session_inactive [%s] not active, no-op", session_id)
 
     def _is_session_active(self, session_id: str) -> bool:
-        return session_id in self._active_session_ids
+        is_active = session_id in self._active_session_ids
+        logger.debug("SSM: _is_session_active [%s] -> %s", session_id, is_active)
+        return is_active
 
     def set_session_block_hashes(
         self, session_id: str, new_hashes: list[BlockHash],
@@ -1511,9 +1529,16 @@ class SessionStateManager:
 
         removed = [s for s in old_states if s.block_hash not in new_set]
         added = [h for h in new_hashes if h not in old_hashes]
+        logger.debug(
+            "SSM: set_session_block_hashes enter [%s] old=%d new=%d added=%d removed=%d common=%d",
+            session_id, len(old_states), len(new_hashes), len(added), len(removed),
+            len(old_hashes & new_set),
+        )
         if removed or added:
-            logger.info("SSM: set_session_block_hashes [%s] %d -> %d hashes (added=%d, removed=%d)",
+            logger.debug("SSM: set_session_block_hashes [%s] %d -> %d hashes (added=%d, removed=%d)",
                          session_id, len(old_states), len(new_hashes), len(added), len(removed))
+        else:
+            logger.debug("SSM: set_session_block_hashes [%s] no diff, common=%d", session_id, len(old_hashes))
 
         for state in removed:
             # removed：仅 state 层减 ref / 归零删 entry（SSM 是 state 权威）。
@@ -1547,8 +1572,9 @@ class SessionStateManager:
         # list 保序 = hash_block_size 粒度的位置顺序。
         self._session_hash_state[session_id] = new_state_list
 
-        logger.info("SSM: set_session_block_hashes [%s] %d new global entries, %d reset to HBM, total managed hashes=%d",
-                      session_id, new_count, reset_count, len(self._hash_state))
+        if new_count or reset_count:
+            logger.debug("SSM: set_session_block_hashes [%s] %d new global entries, %d reset to HBM, total managed hashes=%d",
+                         session_id, new_count, reset_count, len(self._hash_state))
         self._lru.set_hash_count(session_id, len(new_hashes))
         self.mark_session_active(session_id)
         self._lru.touch(session_id)
@@ -1574,15 +1600,22 @@ class SessionStateManager:
           - ``skipped``:    [state for state in active_shared_or_max_reached]
                             no change
         """
+        logger.debug(
+            "SSM: classify_offload_work enter [%s] states=%d active_sessions=%s",
+            session_id, len(states), self._active_session_ids,
+        )
         hbm_work: list[tuple[BlockHashState, list[int | None]]] = []
         remote_work: list[BlockHash] = []
         skipped: list[BlockHashState] = []
+        skip_reasons: dict[str, int] = {}
         for state in states:
             if state.is_shared_with_active_session(session_id, self._is_session_active):
                 skipped.append(state)
+                skip_reasons["active_share"] = skip_reasons.get("active_share", 0) + 1
                 continue
             if state.offload_count >= state.max_offload_count:
                 skipped.append(state)
+                skip_reasons["max_reached"] = skip_reasons.get("max_reached", 0) + 1
                 continue
             reached_bottom = state.offload_once()
             # 仅快照、不清空 block_ids_per_group：offload 不动 block.sessions
@@ -1597,6 +1630,8 @@ class SessionStateManager:
 
         logger.info("SSM: classify_offload_work [%s] hbm=%d remote=%d skipped=%d",
                      session_id, len(hbm_work), len(remote_work), len(skipped))
+        if skip_reasons:
+            logger.debug("SSM: classify_offload_work [%s] skip_breakdown=%s", session_id, skip_reasons)
         self._lru.touch(session_id)
         return {"hbm_work": hbm_work, "remote_work": remote_work, "skipped": skipped}
 
@@ -1612,6 +1647,13 @@ class SessionStateManager:
         start: int | None = None,
         end: int | None = None,
     ) -> dict[str, list[tuple[BlockHashState, list[int | None]]]]:
+        logger.debug(
+            "SSM: classify_evict_work enter [%s] states=%d is_session_op=%s range=[%s,%s) "
+            "session_hash_len=%d active_sessions=%s",
+            session_id, len(states), is_session_op, start, end,
+            len(self._session_hash_state.get(session_id, [])),
+            self._active_session_ids,
+        )
         """Classify states for evict + mutate state at classify time.
 
         Returns EvictWork dict:
@@ -1712,16 +1754,29 @@ class SessionStateManager:
         self, session_id: str, block_hashes: list[BlockHash],
     ) -> None:
         """Reset offload_count of the input hashes back to 0 (HBM)."""
+        logger.debug(
+            "SSM: process_prefetch_hashes enter [%s] block_hashes=%d hash_state_size=%d lru_managed=%s",
+            session_id, len(block_hashes), len(self._hash_state),
+            self._lru.is_managed(session_id),
+        )
         if not block_hashes:
+            logger.debug("SSM: process_prefetch_hashes [%s] empty input, no-op", session_id)
             return
         reset_count = 0
+        not_found_count = 0
         for h in block_hashes:
             state = self._hash_state.get(h)
-            if state is not None and state.offload_count != 0:
+            if state is None:
+                not_found_count += 1
+                continue
+            if state.offload_count != 0:
                 state.offload_count = 0
                 reset_count += 1
         logger.info("SSM: process_prefetch_hashes [%s] reset %d / %d hashes to HBM",
                      session_id, reset_count, len(block_hashes))
+        if not_found_count:
+            logger.debug("SSM: process_prefetch_hashes [%s] %d hashes not found in _hash_state",
+                         session_id, not_found_count)
         if self._lru.is_managed(session_id):
             self._lru.touch(session_id)
 
@@ -1733,12 +1788,24 @@ class SessionStateManager:
         Stops early if no inactive candidate is available (avoids spinning
         while all remaining sessions are active).
         """
+        logger.debug(
+            "SSM: _try_evict_if_needed enter lru_len=%d max=%d is_full=%s active_count=%d",
+            len(self._lru), self._lru.max_sessions, self._lru.is_full(),
+            len(self._active_session_ids),
+        )
+        if not self._lru.is_full():
+            logger.debug("SSM: _try_evict_if_needed LRU not full, no-op")
+            return
         remaining_budget = len(self._lru)
         while self._lru.is_full() and remaining_budget > 0:
             remaining_budget -= 1
             candidates = self._lru.get_evict_candidates(
                 count=1, active_session_ids=self._active_session_ids)
             if not candidates:
+                logger.debug(
+                    "SSM: _try_evict_if_needed no inactive candidate (lru=%d active=%d), stop",
+                    len(self._lru), len(self._active_session_ids),
+                )
                 return
 
             sid = candidates[0]
