@@ -24,6 +24,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.core.agent_hint.session_aware_pooling_manager import (
     PrefetchRequest,
 )
@@ -578,10 +579,11 @@ class KVPoolScheduler:
                     return 0, False
                 if self.client is None:
                     self.client = LookupKeyClient(self.vllm_config)
-                if self.client_spm is None:
-                    self.client_spm = LookupKeyClient(self.vllm_config, rpc_port_bias=1)
-                if self.client_spm_remove is None:
-                    self.client_spm_remove = LookupKeyClient(self.vllm_config, rpc_port_bias=2)
+                if ascend_envs.VLLM_ASCEND_ENABLE_AGENT_HINT:
+                    if self.client_spm is None:
+                        self.client_spm = LookupKeyClient(self.vllm_config, rpc_port_bias=1)
+                    if self.client_spm_remove is None:
+                        self.client_spm_remove = LookupKeyClient(self.vllm_config, rpc_port_bias=2)
                 num_external_hit_tokens = self.client.lookup(
                     token_len,
                     request.block_hashes,

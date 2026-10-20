@@ -28,6 +28,12 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Enable Agent Hint session/TTL management and its KV blocks/free queue.
+    # Non-sensitive. Valid values: 0 (default, disabled), 1 (enabled).
+    # Requires the Ascend platform and prefix caching. Optional remote cache
+    # management requires a non-layerwise AscendStoreConnector with an explicit
+    # backend of mooncake or memcache. Set before starting the engine.
+    "VLLM_ASCEND_ENABLE_AGENT_HINT": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_AGENT_HINT", "0"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

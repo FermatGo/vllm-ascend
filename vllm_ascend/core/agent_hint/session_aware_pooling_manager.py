@@ -490,9 +490,15 @@ class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
 
 def create_session_aware_pooling_manager(
     context: AgentHintManagerContext,
-) -> SessionAwarePoolingManager | None:
+) -> SessionAwarePoolingManager:
     """Create the spm for the mem pool backend."""
-    backend = context.vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", None)
+    transfer_config = context.vllm_config.kv_transfer_config
+    if transfer_config is None:
+        raise ValueError("Agent Hint remote cache management requires kv_transfer_config.")
+    extra_config = transfer_config.kv_connector_extra_config
+    if extra_config.get("use_layerwise", False):
+        raise ValueError("Agent Hint remote cache management requires AscendStoreConnector with use_layerwise=false.")
+    backend = extra_config.get("backend")
     if backend == "mooncake":
         logger.info(f"Init session aware pooling manager for pooling backend {backend}")
         return SessionAwarePoolingManager(context.kv_cache_manager, context.add_request, context.connector, context.hash_block_size)
@@ -500,5 +506,7 @@ def create_session_aware_pooling_manager(
         logger.info(f"Init session aware pooling manager for pooling backend {backend}")
         return MemcacheSessionAwarePoolingManager(context.kv_cache_manager, context.add_request, context.connector, context.hash_block_size)
     else:
-        logger.warning(f"Pooling backend {backend} is not supported yet for session aware pooling manager.")
-        return
+        raise ValueError(
+            "Agent Hint remote cache management requires kv_connector_extra_config['backend'] "
+            f"to be 'mooncake' or 'memcache'; got {backend!r}."
+        )
