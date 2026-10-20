@@ -728,10 +728,19 @@ class SessionAwareManager:
         block_ids_per_group 在 on_blocks_allocated / on_block_cache_hit
         回调中按物理 block 填入。
         """
-        logger.info(
-            "SAM: register_session_block_hash session=%s block_hashes=%d",
-            session_id, len(block_hashes),
-        )
+        prev_hashes = self._session_hashes.get(session_id, [])
+        prev_count = len(prev_hashes) if prev_hashes is not None else 0
+        new_count = len(block_hashes)
+        if new_count != prev_count:
+            logger.info(
+                "SAM: register_session_block_hash session=%s block_hashes=%d → %d",
+                session_id, prev_count, new_count,
+            )
+        else:
+            logger.debug(
+                "SAM: register_session_block_hash session=%s unchanged=%d (no-op)",
+                session_id, new_count,
+            )
         self._session_state_manager.set_session_block_hashes(session_id, block_hashes)
 
     def _get_block(self, block_id: int) -> KVCacheBlock:
