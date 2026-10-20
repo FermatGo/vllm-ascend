@@ -1955,14 +1955,15 @@ class SessionStateManager:
         Stops early if no inactive candidate is available (avoids spinning
         while all remaining sessions are active).
         """
-        logger.debug(
+        if not self._lru.is_full():
+            logger.debug("SSM: _try_evict_if_needed LRU not full (lru=%d max=%d), no-op",
+                         len(self._lru), self._lru.max_sessions)
+            return
+        logger.info(
             "SSM: _try_evict_if_needed enter lru_len=%d max=%d is_full=%s active_count=%d",
             len(self._lru), self._lru.max_sessions, self._lru.is_full(),
             len(self._active_session_ids),
         )
-        if not self._lru.is_full():
-            logger.debug("SSM: _try_evict_if_needed LRU not full, no-op")
-            return
         remaining_budget = len(self._lru)
         while self._lru.is_full() and remaining_budget > 0:
             remaining_budget -= 1
