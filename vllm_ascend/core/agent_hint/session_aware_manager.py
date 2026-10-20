@@ -74,6 +74,12 @@ class SessionAwareManager:
     """
 
     def __init__(self, kv_cache_manager: KVCacheManager):
+        logger.info(
+            "SAM: __init__ enter num_kv_cache_groups=%s block_size=%s hash_block_size=%s",
+            kv_cache_manager.num_kv_cache_groups,
+            tuple(sprc.block_size for sprc in kv_cache_manager.coordinator.single_type_managers),
+            kv_cache_manager.block_pool.hash_block_size,
+        )
         self.kv_cache_manager = kv_cache_manager
         self.num_kv_cache_groups = kv_cache_manager.num_kv_cache_groups
         self.block_size = tuple(sprc.block_size for sprc in self.kv_cache_manager.coordinator.single_type_managers)
@@ -108,6 +114,10 @@ class SessionAwareManager:
             ssm_classify_evict=self._session_state_manager.classify_evict_work,
             spm_notify=self._notify_event,
         )
+        logger.info("SAM: __init__ done ttl_manager=%s ssm=%s controller=%s",
+                     self._ttl_manager is not None,
+                     self._session_state_manager is not None,
+                     self._session_controller is not None)
 
     def on_blocks_allocated_for_request(
         self, request: Request, blocks: KVCacheBlocks, cached_blocks_len_before: tuple[int, ...] | None = None
@@ -118,6 +128,11 @@ class SessionAwareManager:
         # 如果 request 没有 session_id，则不进行 session 相关的处理
         # 但是清理所有 block 的 session 引用和 TTL，避免残留
         if not hint or hint.session_id is None:
+            total_blocks = sum(len(bids) for bids in blocks.get_block_ids())
+            logger.info(
+                "SAM: on_blocks_allocated_for_request no session, request=%s total_blocks=%d (clearing refs)",
+                request.request_id, total_blocks,
+            )
             for group_id, block_ids in enumerate(blocks.get_block_ids()):
                 for block_id in block_ids:
                     block = self._get_block(block_id)
@@ -130,10 +145,11 @@ class SessionAwareManager:
             return
 
         is_prefill = request.num_output_tokens == 0
+        per_group_counts = [len(bids) for bids in blocks.get_block_ids()]
         logger.info(
-            f"on_blocks_allocated_for_request, request_id = {request.request_id}, "
-            f"session_id = {hint.session_id if hint else None}, "
-            f"request.num_output_tokens: {request.num_output_tokens}"
+            f"SAM: on_blocks_allocated_for_request request={request.request_id} "
+            f"session={hint.session_id} is_prefill={is_prefill} "
+            f"per_group_blocks={per_group_counts} cached_before={cached_blocks_len_before}"
         )
 
         self._register_blocks_to_session(
@@ -148,11 +164,13 @@ class SessionAwareManager:
     def on_block_cache_hit_for_request(self, request: Request, blocks: KVCacheBlocks) -> None:
         hint = get_agent_hint_params(request)
         if hint is None or hint.session_id is None:
+            logger.info("SAM: on_block_cache_hit_for_request no hint/session, request=%s skipped", request.request_id)
             return
 
+        per_group_counts = [len(bids) for bids in blocks.get_block_ids()]
         logger.info(
-            f"on_block_cache_hit_for_request, request_id = {request.request_id}, "
-            f"session_id = {hint.session_id if hint else None}, "
+            f"SAM: on_block_cache_hit_for_request request={request.request_id} "
+            f"session={hint.session_id} per_group_blocks={per_group_counts}"
         )
 
         self._register_blocks_to_session(
@@ -192,8 +210,15 @@ class SessionAwareManager:
         newly_protected_ttl: float = 0.0
         protected_block_hashes: list[BlockHash] = []
 
+        logger.info(
+            "SAM: _register_blocks_to_session enter session=%s is_cache_hit=%s is_prefill=%s "
+            "ephemeral=%s cached_before=%s",
+            session_id, is_cache_hit, is_prefill,
+            ephemeral_range is not None, cached_blocks_len_before,
+        )
+
         for group_id, block_ids in enumerate(blocks.get_block_ids()):
-            logger.debug(f"register_blocks_to_session, block_ids={block_ids}")
+            logger.info(f"SAM: _register_blocks_to_session group=%d block_ids={block_ids}", group_id)
             cached_blocks_len = cached_blocks_len_before[group_id] if cached_blocks_len_before else 0
 
             for ind, block_id in enumerate(block_ids):
@@ -210,7 +235,7 @@ class SessionAwareManager:
 
                 # allocate_slots理论上只传 newly-cached blocks，保留检查用于防御异常情况。
                 if block.block_hash is None:
-                    logger.debug("Newly cached block %s has no block hash", block_id)
+                    logger.info("SAM: _register_blocks_to_session block=%d has no block_hash, skip", block_id)
                     continue
 
                 physical_hash = get_block_hash(block.block_hash)
@@ -220,6 +245,11 @@ class SessionAwareManager:
                 # register 时为全 None，此处填入实际 block_id）
                 if state is not None:
                     state.add_block_id(group_id, block_id)
+                else:
+                    logger.info(
+                        "SAM: _register_blocks_to_session block=%d hash=%s not in _hash_state (not registered yet?)",
+                        block_id, physical_hash,
+                    )
 
                 # ephemeral TTL 判定（沿用现有逻辑）
                 if is_cache_hit:
@@ -249,6 +279,10 @@ class SessionAwareManager:
                     if is_ephemeral:
                         newly_protected_hashes.append((block_id, block.block_hash))
                         newly_protected_ttl = ttl_expire_at
+                        logger.info(
+                            "SAM: _register_blocks_to_session block=%d marked ephemeral ttl=%.2f",
+                            block_id, ttl_expire_at,
+                        )
                 else:
                     # cache hit：是否已注册改为 sid in block.sessions
                     is_registered = session_id in block.sessions
@@ -262,6 +296,10 @@ class SessionAwareManager:
                         if is_ephemeral:
                             newly_protected_hashes.append((block_id, block.block_hash))
                             newly_protected_ttl = ttl_expire_at
+                            logger.info(
+                                "SAM: _register_blocks_to_session cache-hit block=%d new ephemeral ttl=%.2f",
+                                block_id, ttl_expire_at,
+                            )
                     elif is_ephemeral:
                         # 已注册则刷新 TTL：block 级取更晚的过期时间。
                         new_expire_at = max(block.ttl_expire_at, ttl_expire_at)
@@ -271,28 +309,47 @@ class SessionAwareManager:
                         )
                         newly_protected_hashes.append((block_id, block.block_hash))
                         newly_protected_ttl = new_expire_at
+                        logger.info(
+                            "SAM: _register_blocks_to_session cache-hit block=%d refreshed ephemeral ttl=%.2f (was %.2f)",
+                            block_id, new_expire_at, block.ttl_expire_at,
+                        )
 
+        logger.info(
+            "SAM: _register_blocks_to_session exit session=%s newly_protected=%d protected_block_hashes=%d "
+            "ttl_to_register=%.2f",
+            session_id, len(newly_protected_hashes), len(protected_block_hashes), newly_protected_ttl,
+        )
         if ephemeral_range:
             scale_factor = max(self.block_size) // self.hash_block_size
             session_states = self._session_hashes.get(session_id, [])
             block_end = (ephemeral_range.block_offset + scale_factor) // scale_factor * scale_factor
             if ephemeral_range.block_offset + 1 > len(session_states):
-                logger.warning(f"ephemeral range exceed session block hash. session id:{session_id}")
+                logger.warning(f"SAM: ephemeral range exceed session block hash. session id:{session_id}")
                 block_end = len(session_states)
 
             if newly_protected_hashes and session_states:
                 protected_block_hashes = [s.block_hash for s in session_states[0:block_end]]
 
-        self._ttl_manager.register(
-            block_infos=[],
-            session_id=session_id,
-            expire_at=newly_protected_ttl,
-            protected_block_hashes=protected_block_hashes,
-        )
+        # 仅在有真实保护内容时才注册，避免无效调用 + 早退噪音
+        if protected_block_hashes and newly_protected_ttl > 0.0:
+            self._ttl_manager.register(
+                block_infos=[],
+                session_id=session_id,
+                expire_at=newly_protected_ttl,
+                protected_block_hashes=protected_block_hashes,
+            )
+        else:
+            logger.info(
+                "SAM: _register_blocks_to_session skip TTL register (protected=%d ttl=%.2f)",
+                len(protected_block_hashes), newly_protected_ttl,
+            )
 
     def _on_ttl_expired(self, block_id: int, session_id: str) -> None:
         """ephemeral block TTL 到期回调"""
-        logger.debug(f"working on _on_ttl_expired in SAM for block {block_id} and session id {session_id}")
+        logger.info(
+            "SAM: _on_ttl_expired block=%d session=%s — clearing block TTL (session refs preserved)",
+            block_id, session_id,
+        )
 
         # 统一接口：TTL 到期只清除 block 的 TTL，不动两个引用计数
         # （session 引用仍在，num_session_refs 保持为 block.sessions
@@ -321,17 +378,27 @@ class SessionAwareManager:
         block = self._get_block(block_id)
         session_ids = list(block.sessions)
         if not session_ids:
+            logger.info("SAM: clear_block_session_refs block=%d no sessions, no-op", block_id)
             return
 
         # 只读反查：日志观察当前 hash 维度绑定（不修改 state）
         if block.block_hash is not None:
             state = self._hash_state.get(get_block_hash(block.block_hash))
             if state is not None:
-                logger.debug(
-                    "clear_block_session_refs: block %s currently bound to hash state "
-                    "(block_ids_per_group=%s), %d stale session refs to clear",
-                    block_id, state.block_ids_per_group, len(session_ids),
+                logger.info(
+                    "SAM: clear_block_session_refs block=%d hash_state=%s block_ids_per_group=%s clearing %d sessions=%s",
+                    block_id, state.block_hash, state.block_ids_per_group, len(session_ids), session_ids,
                 )
+            else:
+                logger.info(
+                    "SAM: clear_block_session_refs block=%d hash=%s not in _hash_state, clearing %d sessions",
+                    block_id, get_block_hash(block.block_hash), len(session_ids),
+                )
+        else:
+            logger.info(
+                "SAM: clear_block_session_refs block=%d no block_hash, clearing %d sessions",
+                block_id, len(session_ids),
+            )
 
         block.sessions.clear()
         # 物理引用全部终结（num_session_refs 派生自 sessions，自动归零）
@@ -355,6 +422,10 @@ class SessionAwareManager:
         """
         states = self._session_hashes.get(session_id)
         if not states:
+            logger.info(
+                "SAM: get_session_hash_states_for_range session=%s no states, returning empty",
+                session_id,
+            )
             return [], 0, 0
 
         total = len(states)
@@ -363,10 +434,19 @@ class SessionAwareManager:
         block_end = min(block_end, total)
 
         if block_start >= block_end:
+            logger.info(
+                "SAM: get_session_hash_states_for_range session=%s invalid range [%d,%d) (total=%d), empty",
+                session_id, block_start, block_end, total,
+            )
             return [], block_start, block_end
 
         expanded_start, expanded_end = self._expand_session_block_range(session_id, block_start, block_end)
-        return states[expanded_start:expanded_end], expanded_start, expanded_end
+        sliced = states[expanded_start:expanded_end]
+        logger.info(
+            "SAM: get_session_hash_states_for_range session=%s req=[%d,%d) expanded=[%d,%d) total=%d returned=%d",
+            session_id, block_start, block_end, expanded_start, expanded_end, total, len(sliced),
+        )
+        return sliced, expanded_start, expanded_end
 
     def _on_session_evicted_remote(self, session_id: str, freed_hashes: list[BlockHash]) -> None:
         """evict 后统一通知 SPM（Controller 路径与 SSM LRU 路径共用）。
@@ -375,12 +455,21 @@ class SessionAwareManager:
         - ``context_management_evict``：远端数据实际删除（按 backend 实现）。
         """
         if not freed_hashes:
+            logger.info("SAM: _on_session_evicted_remote session=%s no freed_hashes, no-op", session_id)
             return
+        logger.info(
+            "SAM: _on_session_evicted_remote session=%s freed_hashes=%d",
+            session_id, len(freed_hashes),
+        )
         self._notify_event("session_blocks_removed", session_id=session_id, block_hashes=freed_hashes)
         self._notify_event("context_management_evict", block_hashes=freed_hashes)
 
     def _execute_prefetch(self, session_id: str, block_hashes: list[BlockHash]) -> int:
         """通知 SPM 创建远端预取任务。"""
+        logger.info(
+            "SAM: _execute_prefetch session=%s block_hashes=%d",
+            session_id, len(block_hashes),
+        )
         self._notify_event(
             "context_management_prefetch",
             session_id=session_id,
@@ -410,10 +499,15 @@ class SessionAwareManager:
         返回 freed_hashes：仅含 ref_count 归 0（无其他 session 共享）的
         hash，调用方据此通知 SPM 删除远端数据。
         """
+        logger.info(
+            "SAM: apply_evict_kvblock enter session=%s is_session_op=%s work=%d",
+            session_id, is_session_op, len(work),
+        )
         freed_hashes: list[BlockHash] = []
         # 同一物理 block 可能被同一 session 的多个基础 hash 覆盖
         # （group block_size > hash_block_size），去重保证每个 block 只处理一次。
         seen_block_ids: set[int] = set()
+        skipped_no_ref = 0
 
         for state, block_ids in work:
             is_exclusive = state.ref_count == 0
@@ -427,6 +521,7 @@ class SessionAwareManager:
                 if session_id not in block.sessions:
                     # 该 session 在此 block 上没有物理引用（重复 evict /
                     # 引用已在 block 复用时清理），幂等跳过
+                    skipped_no_ref += 1
                     continue
                 block.sessions.discard(session_id)
                 # 逐 block 清理该 session 的 ephemeral TTL 表项，
@@ -441,12 +536,24 @@ class SessionAwareManager:
         # TTL 清理在 SAM 内部做（SAM 负责 TTL）。session-evict 与 range-evict
         # 均清理该 session 的 hash 维度 TTL 记录（block_id=-1 语义，
         # 见设计 §4.4 TODO 说明：按整条 session 粒度清理）。
-        self._ttl_manager.remove(block_id=-1, session_id=session_id)
+        # 仅在该 session 确实注册过 TTL 时才 remove，避免无谓 warning 噪音。
+        if (-1, session_id) in self._ttl_manager._entries:
+            self._ttl_manager.remove(block_id=-1, session_id=session_id)
+        else:
+            logger.info(
+                "SAM: apply_evict_kvblock [%s] no hash-level TTL entry, skip ttl_manager.remove",
+                session_id,
+            )
 
         if freed_hashes:
             logger.info(
-                "SAM: apply_evict_kvblock [%s] is_session_op=%s states=%d freed_hashes=%d blocks=%d",
-                session_id, is_session_op, len(work), len(freed_hashes), len(seen_block_ids),
+                "SAM: apply_evict_kvblock [%s] is_session_op=%s states=%d freed_hashes=%d blocks=%d skipped_no_ref=%d",
+                session_id, is_session_op, len(work), len(freed_hashes), len(seen_block_ids), skipped_no_ref,
+            )
+        else:
+            logger.info(
+                "SAM: apply_evict_kvblock [%s] no exclusive hash freed (states=%d blocks=%d skipped_no_ref=%d)",
+                session_id, len(work), len(seen_block_ids), skipped_no_ref,
             )
         return freed_hashes
 
@@ -468,7 +575,7 @@ class SessionAwareManager:
 
         states = self._session_hashes.get(session_id)
         if not states:
-            logger.warning(f"There is no hash for the session_id:{session_id} in the _session_hashes.")
+            logger.warning(f"SAM: _get_session_global_block_ids no hash for session_id:{session_id}.")
             return result, []
 
         total = len(states)
@@ -479,10 +586,8 @@ class SessionAwareManager:
         # 防止负数下标被 Python 当成从末尾索引。
         if block_start < 0 or block_end < 0 or block_start >= block_end:
             logger.warning(
-                "Invalid block range for session %s: [%s, %s)",
-                session_id,
-                block_start,
-                block_end,
+                "SAM: _get_session_global_block_ids invalid range for session %s: [%s, %s)",
+                session_id, block_start, block_end,
             )
             return result, []
 
@@ -497,57 +602,92 @@ class SessionAwareManager:
                 if bid is not None and bid not in result[gid]:
                     result[gid].append(bid)
 
+        logger.info(
+            "SAM: _get_session_global_block_ids session=%s range=[%d,%d) expanded=[%d,%d) "
+            "per_group_counts=%s union_hashes=%d",
+            session_id, block_start, block_end, expanded_start, expanded_end,
+            [len(g) for g in result], len(union_hashes),
+        )
         return result, union_hashes
 
     def _get_session_block_hash(self, session_id: str, block_start: int, block_end: int) -> list[BlockHash]:
         """``_session_hashes[sid]`` 直接取，返回 ``[s.block_hash for s in states[start:end]]``。"""
         states = self._session_hashes.get(session_id)
         if not states:
+            logger.info("SAM: _get_session_block_hash session=%s no states, returning []", session_id)
             return []
         if block_end == -1:
             block_end = len(states)
-        return [s.block_hash for s in states[block_start:block_end]]
+        result = [s.block_hash for s in states[block_start:block_end]]
+        logger.info(
+            "SAM: _get_session_block_hash session=%s range=[%d,%d) total=%d returned=%d",
+            session_id, block_start, block_end, len(states), len(result),
+        )
+        return result
 
     def add_event_listener(self, listener: SessionEventListener):
         """注册事件监听器（SPM 调用）"""
+        logger.info("SAM: add_event_listener %r (total=%d)", listener, len(self._event_listeners) + 1)
         self._event_listeners.append(listener)
 
     def process_prefetch_req(self, num_unfinished_requests: int) -> None:
         """统一 prefetch 入口：调 SPM 处理预取，然后更新 SSM hash 位置为 HBM。"""
+        logger.info(
+            "SAM: process_prefetch_req enter unfinished=%d listeners=%d",
+            num_unfinished_requests, len(self._event_listeners),
+        )
         for listener in tuple(self._event_listeners):
             handler = getattr(listener, "process_prefetch_req", None)
             if handler is not None:
                 results = handler(num_unfinished_requests)
+                logger.info(
+                    "SAM: process_prefetch_req listener=%r returned %d prefetch results",
+                    listener, len(results) if results else 0,
+                )
                 for session_id, block_hashes in results:
                     self._session_state_manager.process_prefetch_hashes(session_id, block_hashes)
                 break
+        else:
+            logger.info("SAM: process_prefetch_req no listener with process_prefetch_req handler")
 
     def _notify_event(self, event_type: str, **kwargs):
         """通知所有监听器"""
         ret = 0
+        handler_count = 0
         for listener in tuple(self._event_listeners):
             handler = getattr(listener, f"on_{event_type}", None)
             if handler is None:
                 continue
+            handler_count += 1
 
             try:
                 ret = handler(**kwargs)
             except Exception:
                 logger.exception(
-                    "Session event listener %r failed while handling %s",
-                    listener,
-                    event_type,
+                    "SAM: _notify_event listener %r failed while handling %s kwargs=%s",
+                    listener, event_type, list(kwargs.keys()),
                 )
+        logger.info(
+            "SAM: _notify_event type=%s listeners=%d handlers_invoked=%d",
+            event_type, len(self._event_listeners), handler_count,
+        )
         return ret
 
     def on_request_completed(self, request_id: str, session_id: str | None) -> None:
         """请求完成回调 — 处理挂起 edits 并通知 SSM 会话不再活跃"""
+        logger.info(
+            "SAM: on_request_completed request=%s session=%s",
+            request_id, session_id,
+        )
         self._session_controller.on_request_completed(request_id)
         if session_id:
             self._session_state_manager.mark_session_inactive(session_id)
+        else:
+            logger.info("SAM: on_request_completed request=%s no session_id, skip SSM inactive", request_id)
 
     def tick(self, now: float | None = None) -> None:
         """推进 TTL timer wheel，并在 LRU 满时尝试淘汰 session。由 scheduler 统一调用。"""
+        logger.info("SAM: tick enter now=%s", now)
         self._ttl_manager.tick(now)
         self._session_state_manager._try_evict_if_needed()
 
@@ -558,7 +698,12 @@ class SessionAwareManager:
         context_management: ContextManagementParams | None,
     ) -> list[Any] | None:
         """register context management to session controller"""
-        logger.info(f"register context management with req id {request_id} session id {session_id}")
+        has_edits = context_management is not None and context_management.edits is not None
+        edit_count = len(context_management.edits) if has_edits else 0
+        logger.info(
+            "SAM: register_agent_hint request=%s session=%s has_edits=%s edit_count=%d",
+            request_id, session_id, has_edits, edit_count,
+        )
         return self._session_controller.process_request_edits(request_id, session_id, context_management)
 
     def register_session_block_hash(self, session_id: str, block_hashes: list[BlockHash]) -> None:
@@ -571,6 +716,10 @@ class SessionAwareManager:
         block_ids_per_group 在 on_blocks_allocated / on_block_cache_hit
         回调中按物理 block 填入。
         """
+        logger.info(
+            "SAM: register_session_block_hash session=%s block_hashes=%d",
+            session_id, len(block_hashes),
+        )
         self._session_state_manager.set_session_block_hashes(session_id, block_hashes)
 
     def _get_block(self, block_id: int) -> KVCacheBlock:
@@ -581,6 +730,7 @@ class SessionAwareManager:
         Reset the session state of a block, clearing its session
         reference count and TTL expiration time.
         """
+        logger.info("SAM: _reset_block_state block=%d", block.block_id if hasattr(block, 'block_id') else '?')
         block.reset_session_state()
 
     def _update_block_meta(
@@ -603,6 +753,10 @@ class SessionAwareManager:
             block.set_session_state(ttl_expire_at=ttl_expire_at)
         if block.ref_cnt == 0 and not block.is_null:
             block_pool.free_block_queue.on_block_meta_changed(block)
+            logger.info(
+                "SAM: _update_block_meta block=%d ttl=%s ref_cnt=0 → re-evaluated free queue zone",
+                block_id, ttl_expire_at,
+            )
 
     def _expand_session_block_range(
         self,
@@ -625,11 +779,15 @@ class SessionAwareManager:
 
         # 空区间没有涉及任何物理 block。
         if block_start == block_end:
+            logger.info(
+                "SAM: _expand_session_block_range session=%s empty range [%d,%d), no-op",
+                session_id, block_start, block_end,
+            )
             return block_start, block_end
 
         states = self._session_hashes.get(session_id)
         if not states:
-            logger.warning(f"There is no hash for the session_id:{session_id} in the _session_hashes.")
+            logger.warning(f"SAM: _expand_session_block_range no hash for session_id:{session_id}.")
             return 0, 0
 
         base_block_count = len(states)
@@ -652,6 +810,10 @@ class SessionAwareManager:
             expanded_end = max(expanded_end, group_block_end)
 
         expanded_end = min(expanded_end, base_block_count)
+        logger.info(
+            "SAM: _expand_session_block_range session=%s req=[%d,%d) → expanded=[%d,%d) (total=%d)",
+            session_id, block_start, block_end, expanded_start, expanded_end, base_block_count,
+        )
         return expanded_start, expanded_end
 
     def apply_offload_kvblock(
@@ -672,7 +834,12 @@ class SessionAwareManager:
         注册 offload TTL 保护（1h hash 维度免疫期）。offload TTL 与
         ephemeral TTL 独立：前者保护 hash 维度，后者保护 block 维度。
         """
+        logger.info(
+            "SAM: apply_offload_kvblock enter session=%s hbm_work=%d ttl_protect=%s",
+            session_id, len(hbm_work), _ENABLE_OFFLOAD_TTL_PROTECT,
+        )
         if not hbm_work:
+            logger.info("SAM: apply_offload_kvblock session=%s empty hbm_work, no-op", session_id)
             return
         if _ENABLE_OFFLOAD_TTL_PROTECT:
             self._ttl_manager.register(
