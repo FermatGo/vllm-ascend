@@ -29,6 +29,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendStoreKVConnectorWorkerMetadata,
     block_hash_to_bytes,
@@ -130,7 +131,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             assert self.connector_worker is not None
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
-                self.spm_lookup_server = LookupKeyServer(self.connector_worker, vllm_config, rpc_port_bias=1)
+                if envs.VLLM_ASCEND_ENABLE_AGENT_HINT:
+                    self.spm_lookup_server = LookupKeyServer(self.connector_worker, vllm_config, rpc_port_bias=1)
 
     ############################################################
     # Scheduler Side Methods
