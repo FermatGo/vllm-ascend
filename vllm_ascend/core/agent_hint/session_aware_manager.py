@@ -167,10 +167,9 @@ class SessionAwareManager:
             logger.debug("SAM: on_block_cache_hit_for_request no hint/session, request=%s skipped", request.request_id)
             return
 
-        per_group_counts = [len(bids) for bids in blocks.get_block_ids()]
         logger.info(
             f"SAM: on_block_cache_hit_for_request request={request.request_id} "
-            f"session={hint.session_id} per_group_blocks={per_group_counts}"
+            f"session={hint.session_id}"
         )
 
         self._register_blocks_to_session(
