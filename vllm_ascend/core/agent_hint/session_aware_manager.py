@@ -114,7 +114,7 @@ class SessionAwareManager:
             ssm_classify_evict=self._session_state_manager.classify_evict_work,
             spm_notify=self._notify_event,
         )
-        logger.info("SAM: __init__ done ttl_manager=%s ssm=%s controller=%s",
+        logger.debug("SAM: __init__ done ttl_manager=%s ssm=%s controller=%s",
                      self._ttl_manager is not None,
                      self._session_state_manager is not None,
                      self._session_controller is not None)
@@ -129,7 +129,7 @@ class SessionAwareManager:
         # 但是清理所有 block 的 session 引用和 TTL，避免残留
         if not hint or hint.session_id is None:
             total_blocks = sum(len(bids) for bids in blocks.get_block_ids())
-            logger.info(
+            logger.debug(
                 "SAM: on_blocks_allocated_for_request no session, request=%s total_blocks=%d (clearing refs)",
                 request.request_id, total_blocks,
             )
@@ -164,7 +164,7 @@ class SessionAwareManager:
     def on_block_cache_hit_for_request(self, request: Request, blocks: KVCacheBlocks) -> None:
         hint = get_agent_hint_params(request)
         if hint is None or hint.session_id is None:
-            logger.info("SAM: on_block_cache_hit_for_request no hint/session, request=%s skipped", request.request_id)
+            logger.debug("SAM: on_block_cache_hit_for_request no hint/session, request=%s skipped", request.request_id)
             return
 
         per_group_counts = [len(bids) for bids in blocks.get_block_ids()]
@@ -210,7 +210,7 @@ class SessionAwareManager:
         newly_protected_ttl: float = 0.0
         protected_block_hashes: list[BlockHash] = []
 
-        logger.info(
+        logger.debug(
             "SAM: _register_blocks_to_session enter session=%s is_cache_hit=%s is_prefill=%s "
             "ephemeral=%s cached_before=%s",
             session_id, is_cache_hit, is_prefill,
@@ -218,7 +218,7 @@ class SessionAwareManager:
         )
 
         for group_id, block_ids in enumerate(blocks.get_block_ids()):
-            logger.info(f"SAM: _register_blocks_to_session group=%d block_ids={block_ids}", group_id)
+            logger.debug(f"SAM: _register_blocks_to_session group=%d block_ids={block_ids}", group_id)
             cached_blocks_len = cached_blocks_len_before[group_id] if cached_blocks_len_before else 0
 
             for ind, block_id in enumerate(block_ids):
@@ -235,7 +235,7 @@ class SessionAwareManager:
 
                 # allocate_slots理论上只传 newly-cached blocks，保留检查用于防御异常情况。
                 if block.block_hash is None:
-                    logger.info("SAM: _register_blocks_to_session block=%d has no block_hash, skip", block_id)
+                    logger.debug("SAM: _register_blocks_to_session block=%d has no block_hash, skip", block_id)
                     continue
 
                 physical_hash = get_block_hash(block.block_hash)
@@ -246,7 +246,7 @@ class SessionAwareManager:
                 if state is not None:
                     state.add_block_id(group_id, block_id)
                 else:
-                    logger.info(
+                    logger.debug(
                         "SAM: _register_blocks_to_session block=%d hash=%s not in _hash_state (not registered yet?)",
                         block_id, physical_hash,
                     )
@@ -279,7 +279,7 @@ class SessionAwareManager:
                     if is_ephemeral:
                         newly_protected_hashes.append((block_id, block.block_hash))
                         newly_protected_ttl = ttl_expire_at
-                        logger.info(
+                        logger.debug(
                             "SAM: _register_blocks_to_session block=%d marked ephemeral ttl=%.2f",
                             block_id, ttl_expire_at,
                         )
@@ -296,7 +296,7 @@ class SessionAwareManager:
                         if is_ephemeral:
                             newly_protected_hashes.append((block_id, block.block_hash))
                             newly_protected_ttl = ttl_expire_at
-                            logger.info(
+                            logger.debug(
                                 "SAM: _register_blocks_to_session cache-hit block=%d new ephemeral ttl=%.2f",
                                 block_id, ttl_expire_at,
                             )
@@ -309,12 +309,12 @@ class SessionAwareManager:
                         )
                         newly_protected_hashes.append((block_id, block.block_hash))
                         newly_protected_ttl = new_expire_at
-                        logger.info(
+                        logger.debug(
                             "SAM: _register_blocks_to_session cache-hit block=%d refreshed ephemeral ttl=%.2f (was %.2f)",
                             block_id, new_expire_at, block.ttl_expire_at,
                         )
 
-        logger.info(
+        logger.debug(
             "SAM: _register_blocks_to_session exit session=%s newly_protected=%d protected_block_hashes=%d "
             "ttl_to_register=%.2f",
             session_id, len(newly_protected_hashes), len(protected_block_hashes), newly_protected_ttl,
@@ -339,14 +339,14 @@ class SessionAwareManager:
                 protected_block_hashes=protected_block_hashes,
             )
         else:
-            logger.info(
+            logger.debug(
                 "SAM: _register_blocks_to_session skip TTL register (protected=%d ttl=%.2f)",
                 len(protected_block_hashes), newly_protected_ttl,
             )
 
     def _on_ttl_expired(self, block_id: int, session_id: str) -> None:
         """ephemeral block TTL 到期回调"""
-        logger.info(
+        logger.debug(
             "SAM: _on_ttl_expired block=%d session=%s — clearing block TTL (session refs preserved)",
             block_id, session_id,
         )
@@ -378,24 +378,24 @@ class SessionAwareManager:
         block = self._get_block(block_id)
         session_ids = list(block.sessions)
         if not session_ids:
-            logger.info("SAM: clear_block_session_refs block=%d no sessions, no-op", block_id)
+            logger.debug("SAM: clear_block_session_refs block=%d no sessions, no-op", block_id)
             return
 
         # 只读反查：日志观察当前 hash 维度绑定（不修改 state）
         if block.block_hash is not None:
             state = self._hash_state.get(get_block_hash(block.block_hash))
             if state is not None:
-                logger.info(
+                logger.debug(
                     "SAM: clear_block_session_refs block=%d hash_state=%s block_ids_per_group=%s clearing %d sessions=%s",
                     block_id, state.block_hash, state.block_ids_per_group, len(session_ids), session_ids,
                 )
             else:
-                logger.info(
+                logger.debug(
                     "SAM: clear_block_session_refs block=%d hash=%s not in _hash_state, clearing %d sessions",
                     block_id, get_block_hash(block.block_hash), len(session_ids),
                 )
         else:
-            logger.info(
+            logger.debug(
                 "SAM: clear_block_session_refs block=%d no block_hash, clearing %d sessions",
                 block_id, len(session_ids),
             )
@@ -422,7 +422,7 @@ class SessionAwareManager:
         """
         states = self._session_hashes.get(session_id)
         if not states:
-            logger.info(
+            logger.debug(
                 "SAM: get_session_hash_states_for_range session=%s no states, returning empty",
                 session_id,
             )
@@ -434,7 +434,7 @@ class SessionAwareManager:
         block_end = min(block_end, total)
 
         if block_start >= block_end:
-            logger.info(
+            logger.debug(
                 "SAM: get_session_hash_states_for_range session=%s invalid range [%d,%d) (total=%d), empty",
                 session_id, block_start, block_end, total,
             )
@@ -442,7 +442,7 @@ class SessionAwareManager:
 
         expanded_start, expanded_end = self._expand_session_block_range(session_id, block_start, block_end)
         sliced = states[expanded_start:expanded_end]
-        logger.info(
+        logger.debug(
             "SAM: get_session_hash_states_for_range session=%s req=[%d,%d) expanded=[%d,%d) total=%d returned=%d",
             session_id, block_start, block_end, expanded_start, expanded_end, total, len(sliced),
         )
@@ -455,9 +455,9 @@ class SessionAwareManager:
         - ``context_management_evict``：远端数据实际删除（按 backend 实现）。
         """
         if not freed_hashes:
-            logger.info("SAM: _on_session_evicted_remote session=%s no freed_hashes, no-op", session_id)
+            logger.debug("SAM: _on_session_evicted_remote session=%s no freed_hashes, no-op", session_id)
             return
-        logger.info(
+        logger.debug(
             "SAM: _on_session_evicted_remote session=%s freed_hashes=%d",
             session_id, len(freed_hashes),
         )
@@ -466,7 +466,7 @@ class SessionAwareManager:
 
     def _execute_prefetch(self, session_id: str, block_hashes: list[BlockHash]) -> int:
         """通知 SPM 创建远端预取任务。"""
-        logger.info(
+        logger.debug(
             "SAM: _execute_prefetch session=%s block_hashes=%d",
             session_id, len(block_hashes),
         )
@@ -499,7 +499,7 @@ class SessionAwareManager:
         返回 freed_hashes：仅含 ref_count 归 0（无其他 session 共享）的
         hash，调用方据此通知 SPM 删除远端数据。
         """
-        logger.info(
+        logger.debug(
             "SAM: apply_evict_kvblock enter session=%s is_session_op=%s work=%d",
             session_id, is_session_op, len(work),
         )
@@ -540,7 +540,7 @@ class SessionAwareManager:
         if (-1, session_id) in self._ttl_manager._entries:
             self._ttl_manager.remove(block_id=-1, session_id=session_id)
         else:
-            logger.info(
+            logger.debug(
                 "SAM: apply_evict_kvblock [%s] no hash-level TTL entry, skip ttl_manager.remove",
                 session_id,
             )
@@ -551,7 +551,7 @@ class SessionAwareManager:
                 session_id, is_session_op, len(work), len(freed_hashes), len(seen_block_ids), skipped_no_ref,
             )
         else:
-            logger.info(
+            logger.debug(
                 "SAM: apply_evict_kvblock [%s] no exclusive hash freed (states=%d blocks=%d skipped_no_ref=%d)",
                 session_id, len(work), len(seen_block_ids), skipped_no_ref,
             )
@@ -602,7 +602,7 @@ class SessionAwareManager:
                 if bid is not None and bid not in result[gid]:
                     result[gid].append(bid)
 
-        logger.info(
+        logger.debug(
             "SAM: _get_session_global_block_ids session=%s range=[%d,%d) expanded=[%d,%d) "
             "per_group_counts=%s union_hashes=%d",
             session_id, block_start, block_end, expanded_start, expanded_end,
@@ -614,12 +614,12 @@ class SessionAwareManager:
         """``_session_hashes[sid]`` 直接取，返回 ``[s.block_hash for s in states[start:end]]``。"""
         states = self._session_hashes.get(session_id)
         if not states:
-            logger.info("SAM: _get_session_block_hash session=%s no states, returning []", session_id)
+            logger.debug("SAM: _get_session_block_hash session=%s no states, returning []", session_id)
             return []
         if block_end == -1:
             block_end = len(states)
         result = [s.block_hash for s in states[block_start:block_end]]
-        logger.info(
+        logger.debug(
             "SAM: _get_session_block_hash session=%s range=[%d,%d) total=%d returned=%d",
             session_id, block_start, block_end, len(states), len(result),
         )
@@ -627,7 +627,7 @@ class SessionAwareManager:
 
     def add_event_listener(self, listener: SessionEventListener):
         """注册事件监听器（SPM 调用）"""
-        logger.info("SAM: add_event_listener %r (total=%d)", listener, len(self._event_listeners) + 1)
+        logger.debug("SAM: add_event_listener %r (total=%d)", listener, len(self._event_listeners) + 1)
         self._event_listeners.append(listener)
 
     def process_prefetch_req(self, num_unfinished_requests: int) -> None:
@@ -642,7 +642,7 @@ class SessionAwareManager:
                 results = handler(num_unfinished_requests)
                 n_results = len(results) if results else 0
                 if n_results > 0:
-                    logger.info(
+                    logger.debug(
                         "SAM: process_prefetch_req listener=%r returned %d prefetch results",
                         listener, n_results,
                     )
@@ -655,7 +655,7 @@ class SessionAwareManager:
                     self._session_state_manager.process_prefetch_hashes(session_id, block_hashes)
                 break
         else:
-            logger.info("SAM: process_prefetch_req no listener with process_prefetch_req handler")
+            logger.debug("SAM: process_prefetch_req no listener with process_prefetch_req handler")
 
     def _notify_event(self, event_type: str, **kwargs):
         """通知所有监听器"""
@@ -674,7 +674,7 @@ class SessionAwareManager:
                     "SAM: _notify_event listener %r failed while handling %s kwargs=%s",
                     listener, event_type, list(kwargs.keys()),
                 )
-        logger.info(
+        logger.debug(
             "SAM: _notify_event type=%s listeners=%d handlers_invoked=%d",
             event_type, len(self._event_listeners), handler_count,
         )
@@ -682,7 +682,7 @@ class SessionAwareManager:
 
     def on_request_completed(self, request_id: str, session_id: str | None) -> None:
         """请求完成回调 — 处理挂起 edits 并通知 SSM 会话不再活跃"""
-        logger.info(
+        logger.debug(
             "SAM: on_request_completed request=%s session=%s",
             request_id, session_id,
         )
@@ -690,7 +690,7 @@ class SessionAwareManager:
         if session_id:
             self._session_state_manager.mark_session_inactive(session_id)
         else:
-            logger.info("SAM: on_request_completed request=%s no session_id, skip SSM inactive", request_id)
+            logger.debug("SAM: on_request_completed request=%s no session_id, skip SSM inactive", request_id)
 
     def tick(self, now: float | None = None) -> None:
         """推进 TTL timer wheel，并在 LRU 满时尝试淘汰 session。由 scheduler 统一调用。"""
@@ -699,7 +699,7 @@ class SessionAwareManager:
         self._ttl_manager.tick(now)
         expired_after = len(self._ttl_manager._entries)
         if expired_before != expired_after:
-            logger.info("SAM: tick expired %d TTL entries (now=%s)",
+            logger.debug("SAM: tick expired %d TTL entries (now=%s)",
                         expired_before - expired_after, now)
         self._session_state_manager._try_evict_if_needed()
 
@@ -712,7 +712,7 @@ class SessionAwareManager:
         """register context management to session controller"""
         has_edits = context_management is not None and context_management.edits is not None
         edit_count = len(context_management.edits) if has_edits else 0
-        logger.info(
+        logger.debug(
             "SAM: register_agent_hint request=%s session=%s has_edits=%s edit_count=%d",
             request_id, session_id, has_edits, edit_count,
         )
@@ -732,7 +732,7 @@ class SessionAwareManager:
         prev_count = len(prev_hashes) if prev_hashes is not None else 0
         new_count = len(block_hashes)
         if new_count != prev_count:
-            logger.info(
+            logger.debug(
                 "SAM: register_session_block_hash session=%s block_hashes=%d → %d",
                 session_id, prev_count, new_count,
             )
@@ -751,7 +751,7 @@ class SessionAwareManager:
         Reset the session state of a block, clearing its session
         reference count and TTL expiration time.
         """
-        logger.info("SAM: _reset_block_state block=%d", block.block_id if hasattr(block, 'block_id') else '?')
+        logger.debug("SAM: _reset_block_state block=%d", block.block_id if hasattr(block, 'block_id') else '?')
         block.reset_session_state()
 
     def _update_block_meta(
@@ -774,7 +774,7 @@ class SessionAwareManager:
             block.set_session_state(ttl_expire_at=ttl_expire_at)
         if block.ref_cnt == 0 and not block.is_null:
             block_pool.free_block_queue.on_block_meta_changed(block)
-            logger.info(
+            logger.debug(
                 "SAM: _update_block_meta block=%d ttl=%s ref_cnt=0 → re-evaluated free queue zone",
                 block_id, ttl_expire_at,
             )
@@ -800,7 +800,7 @@ class SessionAwareManager:
 
         # 空区间没有涉及任何物理 block。
         if block_start == block_end:
-            logger.info(
+            logger.debug(
                 "SAM: _expand_session_block_range session=%s empty range [%d,%d), no-op",
                 session_id, block_start, block_end,
             )
@@ -831,7 +831,7 @@ class SessionAwareManager:
             expanded_end = max(expanded_end, group_block_end)
 
         expanded_end = min(expanded_end, base_block_count)
-        logger.info(
+        logger.debug(
             "SAM: _expand_session_block_range session=%s req=[%d,%d) → expanded=[%d,%d) (total=%d)",
             session_id, block_start, block_end, expanded_start, expanded_end, base_block_count,
         )
