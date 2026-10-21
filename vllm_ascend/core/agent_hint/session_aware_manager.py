@@ -1714,6 +1714,14 @@ class SessionStateManager:
         old_hashes = {s.block_hash for s in old_states}
         new_set = set(new_hashes)
 
+        if old_states and old_hashes == new_set:
+            logger.debug(
+                "SSM: set_session_block_hashes [%s] no-op short-circuit (len=%d)",
+                session_id, len(new_hashes),
+            )
+            self._lru.touch(session_id)
+            return
+
         removed = [s for s in old_states if s.block_hash not in new_set]
         added = [h for h in new_hashes if h not in old_hashes]
         logger.debug(
