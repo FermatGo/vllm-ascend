@@ -73,11 +73,18 @@ class AscendAgentHintManager(AgentHintManager):
             hint.session_id if hint else None,
             hint.context_management if hint else None,
         )
+        request._agent_hint_last_hash_count = 0
 
     def on_request_scheduled(self, request: Request) -> None:
         hint = get_agent_hint_params(request)
-        if hint is not None and hint.session_id:
-            self._session_manager.register_session_block_hash(hint.session_id, request.block_hashes)
+        if hint is None or not hint.session_id:
+            return
+        current_count = len(request.block_hashes)
+        last_count = getattr(request, "_agent_hint_last_hash_count", 0)
+        if current_count == last_count:
+            return
+        request._agent_hint_last_hash_count = current_count
+        self._session_manager.register_session_block_hash(hint.session_id, request.block_hashes)
 
     def on_step(self, num_unfinished_requests: int) -> None:
         self._session_manager.tick()

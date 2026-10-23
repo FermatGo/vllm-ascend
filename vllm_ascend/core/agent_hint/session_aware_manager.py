@@ -726,20 +726,38 @@ class SessionAwareManager:
         block 复用清理路径（clear_block_session_refs）兜底收敛。
         block_ids_per_group 在 on_blocks_allocated / on_block_cache_hit
         回调中按物理 block 填入。
+
+        快速路径：
+          - 长度相等且首尾匹配 → 完全 no-op（decode 多步常见）
+          - append-only（new > prev 且前缀尾部匹配）→ 仅注册尾部新增
+          - 其他（长度减少 / 前缀变化 / 首次注册）→ 走原全量 diff
         """
-        prev_hashes = self._session_hashes.get(session_id, [])
-        prev_count = len(prev_hashes) if prev_hashes is not None else 0
+        prev_states = self._session_hashes.get(session_id, [])
+        prev_count = len(prev_states)
         new_count = len(block_hashes)
-        if new_count != prev_count:
-            logger.debug(
-                "SAM: register_session_block_hash session=%s block_hashes=%d → %d",
-                session_id, prev_count, new_count,
-            )
-        else:
-            logger.debug(
-                "SAM: register_session_block_hash session=%s unchanged=%d (no-op)",
-                session_id, new_count,
-            )
+
+        # 快速路径 1: 长度相等且首尾匹配 → 完全 no-op
+        if new_count == prev_count and prev_count > 0:
+            if (prev_states[0].block_hash == block_hashes[0]
+                    and prev_states[-1].block_hash == block_hashes[-1]):
+                logger.debug(
+                    "SAM: register_session_block_hash session=%s no-op short-circuit (len=%d)",
+                    session_id, new_count,
+                )
+                self._session_state_manager._lru.touch(session_id)
+                return
+
+        # 快速路径 2: append-only（前缀尾部匹配）→ 仅处理 tail
+        if new_count > prev_count and prev_count > 0:
+            if prev_states[-1].block_hash == block_hashes[prev_count - 1]:
+                tail = block_hashes[prev_count:]
+                logger.debug(
+                    "SAM: register_session_block_hash session=%s append-only prev=%d new=%d tail=%d",
+                    session_id, prev_count, new_count, len(tail),
+                )
+                self._session_state_manager.append_session_block_hashes(session_id, tail)
+                return
+
         self._session_state_manager.set_session_block_hashes(session_id, block_hashes)
 
     def _get_block(self, block_id: int) -> KVCacheBlock:
@@ -1771,6 +1789,54 @@ class SessionStateManager:
             logger.debug("SSM: set_session_block_hashes [%s] %d new global entries, %d reset to HBM, total managed hashes=%d",
                          session_id, new_count, reset_count, len(self._hash_state))
         self._lru.set_hash_count(session_id, len(new_hashes))
+        self.mark_session_active(session_id)
+        self._lru.touch(session_id)
+
+    def append_session_block_hashes(
+        self, session_id: str, tail_hashes: list[BlockHash],
+    ) -> None:
+        """Append-only fast path: register only the tail hashes that were
+        added since the last registration.
+
+        Caller (SAM.register_session_block_hash) guarantees:
+          - tail_hashes is the suffix beyond the previously registered count
+          - the previously registered prefix is unchanged
+
+        Complexity: O(len(tail_hashes)) instead of O(n) full diff.
+        """
+        state_list = self._session_hash_state.get(session_id)
+        if state_list is None:
+            # Should not happen if caller checked prev_count > 0, but fall
+            # back safely to full registration.
+            logger.debug(
+                "SSM: append_session_block_hashes [%s] no existing list, fall back to full set",
+                session_id,
+            )
+            self.set_session_block_hashes(session_id, tail_hashes)
+            return
+
+        new_count = 0
+        reset_count = 0
+        for h in tail_hashes:
+            state = self._hash_state.get(h)
+            if state is not None:
+                if state.add_ref(session_id):
+                    reset_count += 1
+            else:
+                state = BlockHashState(
+                    block_hash=h, ref_count=1, ref_sessions={session_id},
+                    offload_count=0,
+                )
+                self._hash_state[h] = state
+                new_count += 1
+            state_list.append(state)
+
+        if new_count or reset_count:
+            logger.debug(
+                "SSM: append_session_block_hashes [%s] tail=%d new_global=%d reset=%d total=%d",
+                session_id, len(tail_hashes), new_count, reset_count, len(state_list),
+            )
+        self._lru.set_hash_count(session_id, len(state_list))
         self.mark_session_active(session_id)
         self._lru.touch(session_id)
 
