@@ -530,6 +530,24 @@ class KVPoolScheduler:
         ]
         return tuple(clipped) if isinstance(block_ids, tuple) else clipped
 
+    def ensure_agent_hint_lookup_clients(self) -> None:
+        """Create the lookup RPC clients on demand.
+
+        ``client`` serves the normal external prefix-cache lookup; the
+        Agent-Hint SPM clients (``rpc_port_bias`` 1/2) serve prefetch lookup
+        and remote removal. They used to be created only inside
+        ``get_num_new_matched_tokens``, so a manage request that arrives
+        before any external lookup found ``None`` and failed with
+        ``'NoneType' object has no attribute 'lookup' / 'remove'``.
+        """
+        if self.client is None:
+            self.client = LookupKeyClient(self.vllm_config)
+        if ascend_envs.VLLM_ASCEND_ENABLE_AGENT_HINT:
+            if self.client_spm is None:
+                self.client_spm = LookupKeyClient(self.vllm_config, rpc_port_bias=1)
+            if self.client_spm_remove is None:
+                self.client_spm_remove = LookupKeyClient(self.vllm_config, rpc_port_bias=2)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -577,13 +595,7 @@ class KVPoolScheduler:
             else:
                 if num_computed_tokens >= token_len:
                     return 0, False
-                if self.client is None:
-                    self.client = LookupKeyClient(self.vllm_config)
-                if ascend_envs.VLLM_ASCEND_ENABLE_AGENT_HINT:
-                    if self.client_spm is None:
-                        self.client_spm = LookupKeyClient(self.vllm_config, rpc_port_bias=1)
-                    if self.client_spm_remove is None:
-                        self.client_spm_remove = LookupKeyClient(self.vllm_config, rpc_port_bias=2)
+                self.ensure_agent_hint_lookup_clients()
                 num_external_hit_tokens = self.client.lookup(
                     token_len,
                     request.block_hashes,
@@ -773,6 +785,12 @@ class KVPoolScheduler:
         num_tokens_to_compute = request.num_computed_tokens + scheduler_output.num_scheduled_tokens[request.req_id]
         request_tuple = self._unfinished_requests.get(request.req_id)
         if request_tuple is None:
+            if request.req_id == "prefetch_company_request":
+                self._unfinished_requests[request.req_id] = (
+                    request,
+                    normalize_block_ids_by_group(request.block_ids),
+                )
+                return None
             raise ValueError(
                 f"Request {request.req_id} is not in _unfinished_requests, but it is scheduled as a new request"
             )
@@ -1146,6 +1164,13 @@ class KVPoolScheduler:
         The removal is delegated to the pool worker via the lookup RPC channel.
         Returns the number of keys submitted for removal.
         """
+        self.ensure_agent_hint_lookup_clients()
+        if self.client_spm_remove is None:
+            logger.warning(
+                "AscendStore remove skipped: Agent-Hint lookup client unavailable "
+                "(VLLM_ASCEND_ENABLE_AGENT_HINT is disabled)"
+            )
+            return
         self.client_spm_remove.remove(
             token_len,
             block_hashes,

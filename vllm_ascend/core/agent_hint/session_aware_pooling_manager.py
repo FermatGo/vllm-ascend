@@ -240,10 +240,21 @@ class SessionAwarePoolingManager(SessionEventListener):
 
     # --- 调度循环集成 ---
     def _lookup_remote_cache(self, block_hashes: list[BlockHash], token_len: int) -> int:
-        res = self.connector.connector_scheduler.client.lookup(
+        scheduler = self.connector.connector_scheduler
+        scheduler.ensure_agent_hint_lookup_clients()
+        # Prefetch must use the SPM lookup channel (rpc_port_bias=1); the
+        # normal external-prefix-cache channel (bias=0) is not guaranteed to be
+        # initialized on a rank that has not served a request yet.
+        client = scheduler.client_spm or scheduler.client
+        if client is None:
+            logger.warning(
+                "SPM prefetch lookup skipped: no lookup client (VLLM_ASCEND_ENABLE_AGENT_HINT disabled?)"
+            )
+            return 0
+        res = client.lookup(
             token_len=token_len,
             block_hashes=block_hashes,
-            kv_cache_group_ids=self.connector.connector_scheduler.kv_cache_group_ids,
+            kv_cache_group_ids=scheduler.kv_cache_group_ids,
         )
         return res
 
@@ -373,6 +384,16 @@ class SessionAwarePoolingManager(SessionEventListener):
                 logger.info(
                     f"prefetch req: local hit tokens num {local_computed_tokens} of total {tmp_prefetch_req.token_len}, block num is {local_computed_block_num}"
                 )
+                if local_computed_tokens >= tmp_prefetch_req.token_len:
+                    logger.info(
+                        "prefetch no-op for request %s session %s: all tokens already in HBM",
+                        tmp_prefetch_req.request_id,
+                        tmp_prefetch_req.session_id,
+                    )
+                    prefetch_results.append(
+                        (tmp_prefetch_req.session_id, tmp_prefetch_req.block_hashes)
+                    )
+                    continue
 
                 exist_external_block_hash = []
                 total_external_matched_tokens = 0
@@ -395,6 +416,17 @@ class SessionAwarePoolingManager(SessionEventListener):
                     f"processing prefetch request {tmp_prefetch_req.request_id} session_id {tmp_prefetch_req.session_id} "
                     f"total_external_matched_tokens {total_external_matched_tokens} local_computed_tokens {local_computed_tokens}"
                 )
+                if total_external_matched_tokens == 0:
+                    logger.info(
+                        "prefetch no-op for request %s session %s: no external KV matched",
+                        tmp_prefetch_req.request_id,
+                        tmp_prefetch_req.session_id,
+                    )
+                    if local_hit_block_hashes:
+                        prefetch_results.append(
+                            (tmp_prefetch_req.session_id, local_hit_block_hashes)
+                        )
+                    continue
 
                 if total_external_matched_tokens + local_computed_tokens > 0:
                     # HBM/远端有命中，尝试分配KV
@@ -429,6 +461,7 @@ class SessionAwarePoolingManager(SessionEventListener):
                         self._submit_prefetch_to_scheduler(tmp_prefetch_req, total_external_matched_tokens)
                     prefetch_results.append((tmp_prefetch_req.session_id, total_hit_block_hashes))
                     self.prefetch_running_queue.append(tmp_req)
+                    break
             except Exception as e:
                 logger.error("Prefetch failed for request %s: %s", tmp_prefetch_req.request_id, e)
                 traceback.print_exc()
@@ -457,13 +490,19 @@ class MemcacheSessionAwarePoolingManager(SessionAwarePoolingManager):
         add_request: Callable[[Request], None],
         connector: KVConnectorBase_V1 | None = None,
         hash_block_size: int | None = None,
-        config: SPMConfig | None = None,):
+        config: SPMConfig | None = None,
+        num_cache_levels: int | None = None):
         super().__init__(kv_cache_manager, add_request, connector, hash_block_size, config)
         self.pooling_cache_controller = PoolingCacheController(
             connector=self.connector,
             block_size=self.block_size,
         )
-        self.num_cache_levels = int(os.environ.get("NUM_CACHE_LEVELS", 2))
+        if num_cache_levels is None:
+            num_cache_levels = os.environ.get(
+                "VLLM_ASCEND_NUM_CACHE_LEVELS",
+                os.environ.get("NUM_CACHE_LEVELS", 2),
+            )
+        self.num_cache_levels = int(num_cache_levels)
 
     def on_context_management_evict(
         self,
@@ -504,7 +543,13 @@ def create_session_aware_pooling_manager(
         return SessionAwarePoolingManager(context.kv_cache_manager, context.add_request, context.connector, context.hash_block_size)
     elif backend == "memcache":
         logger.info(f"Init session aware pooling manager for pooling backend {backend}")
-        return MemcacheSessionAwarePoolingManager(context.kv_cache_manager, context.add_request, context.connector, context.hash_block_size)
+        return MemcacheSessionAwarePoolingManager(
+            context.kv_cache_manager,
+            context.add_request,
+            context.connector,
+            context.hash_block_size,
+            num_cache_levels=extra_config.get("num_cache_levels"),
+        )
     else:
         raise ValueError(
             "Agent Hint remote cache management requires kv_connector_extra_config['backend'] "

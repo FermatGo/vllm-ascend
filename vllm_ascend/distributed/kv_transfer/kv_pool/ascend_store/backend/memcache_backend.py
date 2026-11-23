@@ -245,4 +245,13 @@ class MemcacheBackend(Backend):
     def remove(self, keys: list[str], lazy: bool = False) -> list[int]:
         assert self.store is not None
         flags = _MMC_REMOVE_FLAG_LAZY if lazy else 0
-        return self.store.remove_batch(keys, flags)
+        try:
+            return self.store.remove_batch(keys, flags)
+        except TypeError:
+            if lazy:
+                logger.warning(
+                    "Lazy remove is unavailable in this memcache version; keeping %d keys in the pool.",
+                    len(keys),
+                )
+                return [0] * len(keys)
+            return self.store.remove_batch(keys)
